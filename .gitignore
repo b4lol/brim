@@ -1,0 +1,47 @@
+# ── Rust build artifacts ──────────────────────────────────────────────
+/target
+**/target
+**/*.rs.bk
+*.pdb
+
+# ── Internal documentation (not published to the public repo) ─────────
+/PROJECT.md
+/PHASES.md
+/ROADMAP.md
+/ARCHITECTURE.md
+/TODO.md
+/DECISIONS.md
+/LESSONS.md
+/CHANGELOG.md
+/CODE_REVIEW.md
+/AGENTS.md
+/docs
+
+# ── Workflow / agent scratch ──────────────────────────────────────────
+/.superpowers
+*.orig
+*.rej
+
+# ── Editors & IDEs ────────────────────────────────────────────────────
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.project
+.settings/
+
+# ── OS noise ──────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.directory
+*.tmp
+*.bak
+
+# ── Environment & secrets ─────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key

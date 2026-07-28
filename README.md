@@ -1,0 +1,206 @@
+<div align="center">
+
+# Brim
+
+**A modern, pure-Rust package manager and app store for Fedora Linux.**
+
+[![CI](https://github.com/b4lol/brim/actions/workflows/ci.yml/badge.svg)](https://github.com/b4lol/brim/actions/workflows/ci.yml)
+[![License: GPL v2](https://img.shields.io/badge/license-GPLv2-blue.svg)](LICENSE)
+[![Rust: stable](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
+[![Platform: Fedora](https://img.shields.io/badge/platform-Fedora%2044-51A2DA.svg)](https://fedoraproject.org/)
+
+DNF5 packages, COPR projects and Flathub apps — one engine, three frontends.
+
+`v0.1.6` · Rust edition 2021 · GPL-2.0-only
+
+</div>
+
+---
+
+**Brim** unifies **DNF5** (official RPMs), **COPR** (community projects), and
+**Flatpak** (Flathub) behind a single async engine, and exposes it through
+three frontends: a terminal CLI, a native GTK4/Libadwaita desktop app, and a
+glassmorphic web dashboard with a REST API.
+
+## Screenshots
+
+<p align="center">
+  <img src=".github/screenshots/gui.png" alt="Brim GTK desktop app" width="460"><br>
+  <em>The GTK4 app — real app logos from Flathub and the system icon theme.</em>
+</p>
+
+<p align="center">
+  <img src=".github/screenshots/web.png" alt="Brim web dashboard" width="860"><br>
+  <em>The web dashboard — per-source statistics and glassmorphic design.</em>
+</p>
+
+## Features
+
+- **One search across everything** — merged, relevance-sorted results from
+  Fedora repos, COPR, and Flathub in a single query.
+- **Trending page** — the desktop app opens on Flathub's popular collection,
+  cached on disk for 24 hours (`~/.cache/brim/trending.json`) so repeat visits
+  are instant and offline visits fall back to the stale cache.
+- **Material Design 3 UI** — the desktop app uses virtualized list rows
+  (only visible rows are rendered), an MD3 stylesheet, and a detail dialog
+  per package instead of a card grid.
+- **Native HTTP** — all web access (COPR API, trending, icon downloads) goes
+  through `reqwest` with rustls: pure-Rust TLS, connection reuse, no `curl`
+  dependency at runtime.
+- **Real app logos** — package cards resolve icons from local Flatpak exports,
+  the Flathub CDN (cached in `~/.cache/brim/icons`), and the system icon theme
+  for installed RPMs, with a clean category fallback everywhere else.
+- **COPR discovery that actually works on dnf5-era Fedora** — search/info use
+  the read-only COPR REST API (the `dnf copr` plugin has no `search`); repo
+  enable/disable still go through the plugin. COPR installs are best effort:
+  the repo is enabled first, then the package is installed by project name —
+  if the package step fails, the transaction reports failure but the enabled
+  repo is intentionally left in place (and `remove` disables it again).
+- **Real transactions** — install, remove, upgrade execute actual system
+  changes via `dnf5` / `dnf copr` / `flatpak`; the CLI confirms first
+  (`--yes` to skip).
+- **Repository management** — the desktop app's Repositories page lists,
+  adds and removes flatpak remotes (with `--user` retry and a
+  `--show-disabled` view) and lists/enables/disables COPR repos.
+- **Sync export/import** — back up the installed package set as a versioned
+  JSON file from the Installed page, and reinstall from it on a fresh
+  system.
+- **Updates at a glance** — `dnf5 check-update` and
+  `flatpak remote-ls --updates` merged into one pending-updates view, plus
+  per-source dashboard statistics.
+- **Three frontends, one engine** — everything shares `brim-core`; missing
+  tools degrade gracefully instead of failing.
+- **Shared configuration** — one `~/.config/brim/config.json` for the CLI, the
+  GUI and future services; edit it from the Settings page or with
+  `brim config set`.
+
+## Requirements
+
+- Fedora Linux (developed and verified on Fedora 44) with `dnf5`, `dnf` (COPR
+  plugin), and `flatpak` available
+- Rust stable toolchain via [rustup](https://rustup.rs/) (with the `rustfmt`
+  and `clippy` components for development)
+- For the GUI: system GTK4 and Libadwaita development packages:
+
+  ```bash
+  sudo dnf5 install gtk4-devel libadwaita-devel
+  ```
+
+## Quickstart
+
+```bash
+git clone https://github.com/b4lol/brim
+cd brim
+cargo build --release
+```
+
+Binaries land in `target/release/`: `brim` (CLI), `brim-gui` (desktop app),
+`brim-web` (web server).
+
+## CLI Usage
+
+The terminal companion (binary name: `brim`):
+
+| Command | Description |
+| ------- | ----------- |
+| `brim search <query> [--source <name>]` | Search all sources, or just one |
+| `brim install <id> [--source <name>] [--yes]` | Install (confirms unless `--yes`) |
+| `brim remove <id> [--source <name>] [--yes]` | Remove (confirms unless `--yes`) |
+| `brim upgrade [--yes]` | Upgrade everything across all sources |
+| `brim list` | List installed packages |
+| `brim stats` | Per-source dashboard statistics |
+| `brim info <id> [--source <name>]` | Package details |
+| `brim config list\|get\|set\|reset` | View and edit configuration |
+
+`<name>` is `fedora`, `copr`, or `flatpak`. The confirmation prompt names the
+resolved source before any transaction runs (e.g.
+`Confirm install 'htop' from Fedora? [y/N]`).
+
+Examples:
+
+```bash
+brim search ghostty
+brim search editor --source flatpak
+brim install htop               # asks [y/N] first
+brim install htop.x86_64 --yes  # non-interactive
+brim info @ghostty/ghostty      # COPR project details via the COPR API
+brim upgrade                    # upgrades dnf5 packages and flatpaks
+```
+
+Output is colorized and tabular; transactions show spinners and exit non-zero
+on failure. Pipelines behave (`brim list | head` exits quietly — SIGPIPE is
+handled properly).
+
+## Desktop App
+
+```bash
+cargo run --release -p brim-gui
+```
+
+A native GNOME-style store with six pages — **Trending**, **Updates**,
+**Installed**, **COPR Spotlight**, **Repositories**, **Settings** — debounced
+live search, and toast notifications. The Trending page shows Flathub's
+popular collection
+(24 h disk cache). The Installed page has **Export**/**Import** buttons for
+backing up and restoring the installed set as JSON. Packages render as Material Design 3 list rows in a
+virtualized `ListView` (only the visible rows exist as widgets, so thousands
+of results scroll smoothly); clicking a row opens a detail dialog with the
+full description and actions. All package operations run on a background
+worker that executes requests concurrently, so searches stay responsive even
+during long transactions; icon downloads are batched and rate-limited so they
+never starve core events; destructive actions (Remove, Upgrade All) ask for
+confirmation first; closing the window shuts the worker down cleanly.
+
+## Web Dashboard
+
+```bash
+cargo run --release -p brim-web -- --port 8080   # 8080 is the default
+# then open http://127.0.0.1:8080
+```
+
+The server binds **127.0.0.1 only** and serves both the embedded SPA and the
+REST API:
+
+| Endpoint | Description |
+| -------- | ----------- |
+| `GET /api/packages` | Merged search results as a JSON array of `Package`. Query parameters: `q` (search text; `[]` when omitted), `source` (optional: `fedora`, `copr`, or `flatpak`) |
+| `GET /api/stats` | `SystemStats` dashboard statistics |
+| `POST /api/install` | Body `{"id": "htop", "source": "fedora"}` (`source` may be `null`) → `TransactionResult` |
+| `POST /api/remove` | Same body shape → `TransactionResult` |
+| `POST /api/upgrade` | Upgrade across all backends → `TransactionResult` |
+
+> [!WARNING]
+> The `POST` endpoints perform **real** system transactions. They are guarded
+> by an exact-host `Origin` check — cross-origin requests from other websites
+> are rejected with `403` — and request bodies are capped at 64 KiB. Never
+> widen the bind address: the localhost binding is the security boundary.
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+cargo build --workspace --release
+```
+
+The same four commands run in CI on every push and pull request (see
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+
+The test suite is hermetic — parsers are pure functions over captured fixtures
+and no test spawns a real system command, so tests run anywhere, not just on
+Fedora.
+
+## Contributing
+
+Contributions welcome. Please:
+
+1. Keep changes minimal and focused; match the existing code style.
+2. Keep parsers pure and add fixtures captured from real tool output.
+3. Run the full verification suite above before submitting — all four
+   commands must pass.
+4. Update docs when you change behavior (commands, endpoints, models).
+
+## License
+
+GNU General Public License v2.0 — see the [LICENSE](LICENSE) file.

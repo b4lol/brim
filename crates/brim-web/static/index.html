@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Brim — Package Manager</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="bg-glow glow-a"></div>
+    <div class="bg-glow glow-b"></div>
+
+    <header class="topbar glass">
+        <div class="logo">
+            <span class="logo-mark">◈</span>
+            <span class="logo-text">Brim</span>
+        </div>
+        <input id="search" type="search" placeholder="Search Fedora, COPR and Flatpak packages…"
+               autocomplete="off" spellcheck="false">
+        <button id="upgrade-all" class="btn btn-upgrade" type="button">Upgrade All</button>
+    </header>
+
+    <section id="stats" class="stats-bar glass" aria-live="polite">
+        <div class="stat">
+            <span class="stat-value" id="stat-installed">–</span>
+            <span class="stat-label">Installed</span>
+        </div>
+        <div class="stat">
+            <span class="stat-value" id="stat-updates">–</span>
+            <span class="stat-label">Updates pending</span>
+        </div>
+        <div class="stat-sources" id="stat-sources"></div>
+    </section>
+
+    <main id="results" class="grid">
+        <p class="hint">Type in the search box to browse packages across all sources.</p>
+    </main>
+
+    <div id="toasts" aria-live="polite"></div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

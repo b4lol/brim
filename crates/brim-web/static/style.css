@@ -1,0 +1,330 @@
+/* Brim SPA — dark glassmorphism theme. */
+
+:root {
+    --bg: #0f172a;
+    --bg-card: rgba(30, 41, 59, 0.55);
+    --bg-card-solid: #1e293b;
+    --border: rgba(148, 163, 184, 0.18);
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --accent: #38bdf8;
+    --star: #fbbf24;
+    --ok: #4ade80;
+    --err: #f87171;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    padding: 24px clamp(16px, 5vw, 64px) 64px;
+    overflow-x: hidden;
+}
+
+/* Ambient background glows that make the glass blur visible. */
+.bg-glow {
+    position: fixed;
+    border-radius: 50%;
+    filter: blur(120px);
+    opacity: 0.35;
+    pointer-events: none;
+    z-index: -1;
+}
+
+.glow-a {
+    width: 480px;
+    height: 480px;
+    top: -160px;
+    left: -120px;
+    background: #2563eb;
+}
+
+.glow-b {
+    width: 520px;
+    height: 520px;
+    bottom: -200px;
+    right: -140px;
+    background: #7c3aed;
+}
+
+.glass {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    box-shadow: 0 8px 32px rgba(2, 6, 23, 0.45);
+}
+
+/* Header */
+.topbar {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 14px 20px;
+    position: sticky;
+    top: 16px;
+    z-index: 10;
+}
+
+.logo {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 1.4rem;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.logo-mark {
+    color: var(--accent);
+    font-size: 1.6rem;
+}
+
+#search {
+    flex: 1;
+    min-width: 120px;
+    padding: 10px 16px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: rgba(15, 23, 42, 0.6);
+    color: var(--text);
+    font-size: 1rem;
+    outline: none;
+    transition: border-color 0.15s ease;
+}
+
+#search:focus {
+    border-color: var(--accent);
+}
+
+.btn {
+    padding: 10px 18px;
+    border-radius: 12px;
+    border: 1px solid transparent;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: transform 0.1s ease, opacity 0.15s ease;
+}
+
+.btn:active {
+    transform: scale(0.97);
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+.btn-upgrade {
+    background: linear-gradient(135deg, #0ea5e9, #6366f1);
+    color: #f8fafc;
+}
+
+/* Stats bar */
+.stats-bar {
+    display: flex;
+    align-items: center;
+    gap: 32px;
+    margin: 24px 0;
+    padding: 16px 24px;
+    flex-wrap: wrap;
+}
+
+.stat {
+    display: flex;
+    flex-direction: column;
+}
+
+.stat-value {
+    font-size: 1.6rem;
+    font-weight: 700;
+}
+
+.stat-label {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.stat-sources {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
+.stat-source {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.9rem;
+    color: var(--text-dim);
+}
+
+/* Package grid and cards */
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 20px;
+}
+
+.hint {
+    grid-column: 1 / -1;
+    text-align: center;
+    color: var(--text-dim);
+    padding: 48px 0;
+}
+
+.card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 18px 20px;
+}
+
+.card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.card-name {
+    font-size: 1.1rem;
+    font-weight: 700;
+    word-break: break-all;
+}
+
+.card-summary {
+    color: var(--text-dim);
+    font-size: 0.92rem;
+    flex: 1;
+}
+
+.card-meta {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    flex-wrap: wrap;
+}
+
+.card-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+/* Source badges */
+.badge {
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+}
+
+.badge-fedora {
+    background: rgba(59, 130, 246, 0.18);
+    color: #93c5fd;
+    border: 1px solid rgba(59, 130, 246, 0.45);
+}
+
+.badge-copr {
+    background: rgba(251, 146, 60, 0.15);
+    color: #fdba74;
+    border: 1px solid rgba(251, 146, 60, 0.45);
+}
+
+.badge-flatpak {
+    background: rgba(45, 212, 191, 0.15);
+    color: #5eead4;
+    border: 1px solid rgba(45, 212, 191, 0.45);
+}
+
+/* Star rating */
+.stars {
+    position: relative;
+    display: inline-block;
+    font-size: 1rem;
+    line-height: 1;
+    color: rgba(148, 163, 184, 0.35);
+    letter-spacing: 2px;
+}
+
+.stars .stars-fill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    color: var(--star);
+}
+
+.btn-install {
+    background: rgba(74, 222, 128, 0.14);
+    color: var(--ok);
+    border-color: rgba(74, 222, 128, 0.4);
+}
+
+.btn-remove {
+    background: rgba(248, 113, 113, 0.14);
+    color: #f87171;
+    border-color: rgba(248, 113, 113, 0.4);
+}
+
+/* Toasts */
+#toasts {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    z-index: 100;
+    max-width: min(420px, calc(100vw - 48px));
+}
+
+.toast {
+    padding: 12px 18px;
+    border-radius: 12px;
+    font-size: 0.92rem;
+    animation: toast-in 0.2s ease;
+}
+
+.toast-ok {
+    border-color: rgba(74, 222, 128, 0.45);
+}
+
+.toast-err {
+    border-color: rgba(248, 113, 113, 0.45);
+}
+
+.toast.fade {
+    opacity: 0;
+    transition: opacity 0.4s ease;
+}
+
+@keyframes toast-in {
+    from {
+        transform: translateY(8px);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}

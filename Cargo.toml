@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/brim-core",
+    "crates/brim-cli",
+    "crates/brim-gui",
+    "crates/brim-web",
+]
+
+[workspace.package]
+version = "0.1.6"
+edition = "2021"
+license = "GPL-2.0-only"
+repository = "https://github.com/b4lol/brim"
+
+[workspace.dependencies]
+tokio = { version = "1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
