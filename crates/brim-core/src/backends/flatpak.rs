@@ -116,7 +116,16 @@ impl Backend for FlatpakBackend {
 
     async fn info(&self, id: &str) -> Result<Package> {
         validate_arg(id)?;
-        let out = self.run(&["info", "--", id], Some(QUERY_TIMEOUT)).await?;
+        // `flatpak info` only covers *installed* refs (unlike `dnf5 info`,
+        // which also queries repos): for an available-but-not-installed
+        // ref it exits nonzero, with an error text localized by the host
+        // system helper that cannot be matched reliably. Map any failure
+        // to NotFound so callers (e.g. `resolve`) fall back to search —
+        // otherwise installing a not-yet-installed flatpak by id fails.
+        let out = match self.run(&["info", "--", id], Some(QUERY_TIMEOUT)).await {
+            Ok(out) => out,
+            Err(_) => return Err(BrimError::NotFound(id.to_string())),
+        };
         parse_info(&out).ok_or_else(|| BrimError::NotFound(id.to_string()))
     }
 
