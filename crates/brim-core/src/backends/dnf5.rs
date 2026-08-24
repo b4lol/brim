@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use crate::backend::Backend;
-use crate::backends::{probe, QUERY_TIMEOUT};
+use crate::backends::{probe, validate_arg, QUERY_TIMEOUT};
 use crate::error::{BrimError, Result};
 use crate::models::{Package, PackageStatus, SourceType, TransactionAction, TransactionResult};
 
@@ -48,13 +48,15 @@ impl Dnf5Backend {
             .args(args)
             // Force English output so the parsers see stable headers/fields.
             .env("LC_ALL", "C")
+            // A timed-out query must not leave the dnf5 child running.
+            .kill_on_drop(true)
             .output();
         let output = match timeout {
             Some(limit) => match tokio::time::timeout(limit, future).await {
-                Ok(result) => result?,
+                Ok(result) => result.map_err(|e| super::spawn_error("dnf5", e))?,
                 Err(_) => return Err(BrimError::CommandFailed("dnf5 timed out".to_string())),
             },
-            None => future.await?,
+            None => future.await.map_err(|e| super::spawn_error("dnf5", e))?,
         };
 
         let code = output.status.code().unwrap_or(-1);
@@ -92,6 +94,7 @@ impl Backend for Dnf5Backend {
     }
 
     async fn search(&self, query: &str) -> Result<Vec<Package>> {
+        validate_arg(query)?;
         let out = self
             .run(&["search", "-q", query], false, Some(QUERY_TIMEOUT))
             .await?;
@@ -106,11 +109,13 @@ impl Backend for Dnf5Backend {
     }
 
     async fn info(&self, id: &str) -> Result<Package> {
+        validate_arg(id)?;
         let out = self.run(&["info", id], false, Some(QUERY_TIMEOUT)).await?;
         parse_info(&out).ok_or_else(|| BrimError::NotFound(id.to_string()))
     }
 
     async fn install(&self, pkg: &Package) -> Result<TransactionResult> {
+        validate_arg(&pkg.id)?;
         // Real transaction: no timeout (dnf5 upgrades installed packages).
         let out = self.run(&["install", "-y", &pkg.id], false, None).await?;
         Ok(TransactionResult::ok(
@@ -122,6 +127,7 @@ impl Backend for Dnf5Backend {
     }
 
     async fn remove(&self, pkg: &Package) -> Result<TransactionResult> {
+        validate_arg(&pkg.id)?;
         let out = self.run(&["remove", "-y", &pkg.id], false, None).await?;
         Ok(TransactionResult::ok(
             TransactionAction::Remove,
@@ -163,9 +169,11 @@ fn split_name_arch(nv: &str) -> Option<(&str, &str)> {
 ///
 /// Real dnf5 emits section headers (`Matched fields: name (exact)`) and
 /// package lines shaped ` name.arch<TAB>summary` (older versions used
-/// ` name.arch : summary`). Lines without a separator or arch suffix are
-/// skipped.
+/// ` name.arch : summary`). A package matching several sections is listed
+/// once per section, so results are deduplicated by `name.arch` (first
+/// occurrence wins). Lines without a separator or arch suffix are skipped.
 pub fn parse_search(output: &str) -> Vec<Package> {
+    let mut seen = std::collections::HashSet::new();
     output
         .lines()
         .filter_map(|line| {
@@ -173,6 +181,9 @@ pub fn parse_search(output: &str) -> Vec<Package> {
             let (left, summary) = line.split_once('\t').or_else(|| line.split_once(" : "))?;
             let nv = left.split_whitespace().next()?;
             let (name, _) = split_name_arch(nv)?;
+            if !seen.insert(nv.to_string()) {
+                return None;
+            }
             let mut pkg = Package::new(nv, name, SourceType::FedoraOfficial);
             pkg.summary = summary.trim().to_string();
             pkg.refresh_category();
@@ -219,33 +230,33 @@ fn parse_list_lines(output: &str, status: PackageStatus) -> Vec<Package> {
 
 /// Parse `dnf5 info <id>` output into a single package.
 ///
-/// Returns `None` when no `Name` field is present (unknown package or
-/// empty output). Field lines look like `Name            : htop`;
+/// When a package is both installed and available in a repo, dnf5 prints
+/// two sections (`Installed packages` then `Available packages`) whose
+/// fields must not mix: the installed section wins for an installed
+/// package. Returns `None` when no `Name` field is present (unknown
+/// package or empty output). Field lines look like `Name            : htop`;
 /// description continuations repeat with an empty key.
 pub fn parse_info(output: &str) -> Option<Package> {
-    let mut name: Option<String> = None;
-    let mut arch = String::new();
-    let mut version = String::new();
-    let mut release = String::new();
-    let mut summary = String::new();
-    let mut description = String::new();
-    let mut license: Option<String> = None;
-    let mut homepage: Option<String> = None;
+    let mut blocks: Vec<InfoBlock> = Vec::new();
+    let mut current = InfoBlock::default();
     let mut in_description = false;
-    let mut status = PackageStatus::Available;
+    let mut started = false;
 
     for line in output.lines() {
         let trimmed = line.trim();
-        match trimmed {
-            "Installed packages" => {
-                status = PackageStatus::Installed;
-                continue;
+        let header = match trimmed {
+            "Installed packages" => Some(PackageStatus::Installed),
+            "Available packages" => Some(PackageStatus::Available),
+            _ => None,
+        };
+        if let Some(status) = header {
+            if started {
+                blocks.push(std::mem::take(&mut current));
             }
-            "Available packages" => {
-                status = PackageStatus::Available;
-                continue;
-            }
-            _ => {}
+            current.status = status;
+            started = true;
+            in_description = false;
+            continue;
         }
         let Some((key, value)) = trimmed.split_once(':') else {
             continue;
@@ -255,55 +266,89 @@ pub fn parse_info(output: &str) -> Option<Package> {
         if key.is_empty() {
             // Continuation of the previous multi-line field.
             if in_description && !value.is_empty() {
-                if !description.is_empty() {
-                    description.push(' ');
+                if !current.description.is_empty() {
+                    current.description.push(' ');
                 }
-                description.push_str(value);
+                current.description.push_str(value);
             }
             continue;
         }
         in_description = false;
         match key {
-            "Name" => name = Some(value.to_string()),
-            "Architecture" => arch = value.to_string(),
-            "Version" => version = value.to_string(),
-            "Release" => release = value.to_string(),
-            "Summary" => summary = value.to_string(),
+            "Name" => {
+                current.name = Some(value.to_string());
+                started = true;
+            }
+            "Architecture" => current.arch = value.to_string(),
+            "Version" => current.version = value.to_string(),
+            "Release" => current.release = value.to_string(),
+            "Summary" => current.summary = value.to_string(),
             "Description" => {
-                description = value.to_string();
+                current.description = value.to_string();
                 in_description = true;
             }
-            "License" => license = Some(value.to_string()),
-            "URL" => homepage = Some(value.to_string()),
+            "License" => current.license = Some(value.to_string()),
+            "URL" => current.homepage = Some(value.to_string()),
             _ => {}
         }
     }
-
-    let name = name?;
-    let id = if arch.is_empty() {
-        name.clone()
-    } else {
-        format!("{name}.{arch}")
-    };
-    let full_version = if release.is_empty() {
-        version
-    } else {
-        format!("{version}-{release}")
-    };
-    let mut pkg = Package::new(id, &name, SourceType::FedoraOfficial);
-    // For installed packages the reported version IS the installed one —
-    // keep both fields in sync, like the flatpak backend does.
-    if status == PackageStatus::Installed {
-        pkg.installed_version = Some(full_version.clone());
+    if started {
+        blocks.push(current);
     }
-    pkg.version = full_version;
-    pkg.summary = summary;
-    pkg.refresh_category();
-    pkg.description = description;
-    pkg.license = license;
-    pkg.homepage = homepage;
-    pkg.status = status;
-    Some(pkg)
+
+    // The installed section describes what is actually on the system; only
+    // fall back to an available section when the package is not installed.
+    let block = blocks
+        .iter()
+        .find(|b| b.status == PackageStatus::Installed && b.name.is_some())
+        .or_else(|| blocks.iter().find(|b| b.name.is_some()))?;
+    Some(block.to_package())
+}
+
+/// One `dnf5 info` section (`Installed packages` / `Available packages`).
+#[derive(Default)]
+struct InfoBlock {
+    status: PackageStatus,
+
+    name: Option<String>,
+    arch: String,
+    version: String,
+    release: String,
+    summary: String,
+    description: String,
+    license: Option<String>,
+    homepage: Option<String>,
+}
+
+impl InfoBlock {
+    /// Turn a parsed section into a package; requires a `Name` field.
+    fn to_package(&self) -> Package {
+        let name = self.name.clone().unwrap_or_default();
+        let id = if self.arch.is_empty() {
+            name.clone()
+        } else {
+            format!("{name}.{}", self.arch)
+        };
+        let full_version = if self.release.is_empty() {
+            self.version.clone()
+        } else {
+            format!("{}-{}", self.version, self.release)
+        };
+        let mut pkg = Package::new(id, &name, SourceType::FedoraOfficial);
+        // For installed packages the reported version IS the installed one —
+        // keep both fields in sync, like the flatpak backend does.
+        if self.status == PackageStatus::Installed {
+            pkg.installed_version = Some(full_version.clone());
+        }
+        pkg.version = full_version;
+        pkg.summary = self.summary.clone();
+        pkg.refresh_category();
+        pkg.description = self.description.clone();
+        pkg.license = self.license.clone();
+        pkg.homepage = self.homepage.clone();
+        pkg.status = self.status;
+        pkg
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +379,16 @@ mod tests {
         assert_eq!(pkgs.len(), 1);
         assert_eq!(pkgs[0].name, "htop");
         assert_eq!(pkgs[0].summary, "Interactive process viewer");
+    }
+
+    #[test]
+    fn search_deduplicates_packages_across_match_sections() {
+        // Real dnf5 lists a package once per `Matched fields` section it
+        // matches; the same package must appear only once in the results.
+        let out = "Matched fields: name (exact)\n htop.x86_64\tInteractive process viewer\n\nMatched fields: summary\n htop.x86_64\tInteractive process viewer\n";
+        let pkgs = parse_search(out);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].id, "htop.x86_64");
     }
 
     #[test]
@@ -427,6 +482,28 @@ mod tests {
         assert_eq!(pkg.name, "nonexist");
         assert_eq!(pkg.status, PackageStatus::Available);
         assert_eq!(pkg.installed_version, None);
+    }
+
+    // Real `dnf5 info htop` when htop is installed AND an update is
+    // available: two sections, installed first. The installed section must
+    // win and no field may leak across sections.
+    const INFO_DOUBLE_BLOCK_OUT: &str = "Updating and loading repositories:\nRepositories loaded.\nInstalled packages\nName            : htop\nEpoch           : 0\nVersion         : 3.4.1\nRelease         : 3.fc44\nArchitecture    : x86_64\nInstalled size  : 464.3 KiB\nFrom repository : updates\nSummary         : Interactive process viewer\nURL             : https://htop.dev/\nLicense         : GPL-2.0-or-later\nDescription     : htop is an interactive text-mode process viewer for Linux, similar to\n                : top(1).\nVendor          : Fedora Project\n\nAvailable packages\nName            : htop\nEpoch           : 0\nVersion         : 3.5.0\nRelease         : 1.fc44\nArchitecture    : x86_64\nDownload size   : 200.0 KiB\nRepository      : updates\nSummary         : Interactive process viewer (bleeding edge)\nURL             : https://example.com/NEW\nLicense         : MIT\nDescription     : rewritten available-block description\n";
+
+    #[test]
+    fn info_prefers_installed_block_over_available() {
+        let pkg = parse_info(INFO_DOUBLE_BLOCK_OUT).expect("should parse info");
+        assert_eq!(pkg.name, "htop");
+        assert_eq!(pkg.status, PackageStatus::Installed);
+        // Version fields come from the installed block, not the newer
+        // available block.
+        assert_eq!(pkg.version, "3.4.1-3.fc44");
+        assert_eq!(pkg.installed_version.as_deref(), Some("3.4.1-3.fc44"));
+        // No field mixing across blocks.
+        assert_eq!(pkg.summary, "Interactive process viewer");
+        assert!(pkg.description.contains("top(1)."));
+        assert!(!pkg.description.contains("rewritten"));
+        assert_eq!(pkg.homepage.as_deref(), Some("https://htop.dev/"));
+        assert_eq!(pkg.license.as_deref(), Some("GPL-2.0-or-later"));
     }
 
     #[test]

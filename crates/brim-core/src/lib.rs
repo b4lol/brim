@@ -4,6 +4,7 @@ pub mod backend;
 pub mod backends;
 pub mod config;
 pub mod error;
+pub(crate) mod fsutil;
 pub mod http;
 pub mod manager;
 pub mod models;

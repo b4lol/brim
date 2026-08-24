@@ -54,9 +54,10 @@ pub enum RepoKind {
 }
 
 /// Installation state of a package.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum PackageStatus {
     Installed,
+    #[default]
     Available,
     UpdateAvailable,
 }

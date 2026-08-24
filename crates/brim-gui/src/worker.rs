@@ -8,7 +8,7 @@
 //! transaction (install/remove/upgrade) does not block pending searches.
 //! Events may therefore arrive out of order; the GUI must not assume ordering.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -108,7 +108,8 @@ pub enum CoreEvent {
     /// Batched so a flood of downloads cannot crowd core events (search
     /// results, transaction outcomes) out of the bounded event channel.
     IconsReady(Vec<(String, Option<PathBuf>)>),
-    /// Worker-side infrastructure failure (thread spawn, runtime build).
+    /// Worker-side failure the user should see (thread spawn, runtime
+    /// build, unreadable sync file).
     Error(String),
 }
 
@@ -156,7 +157,7 @@ fn run(rx: Receiver<CoreRequest>, tx: Sender<CoreEvent>) {
                 // Swappable manager: ReloadConfig replaces the Rc; in-flight
                 // tasks keep their snapshot and finish safely.
                 let manager: Rc<RefCell<Rc<PackageManager>>> =
-                    Rc::new(RefCell::new(Rc::new(PackageManager::new())));
+                    Rc::new(RefCell::new(Rc::new(PackageManager::new_async().await)));
                 // Icon fetch results collect here and are flushed as one
                 // batched event every ICON_FLUSH_INTERVAL (see below).
                 let icon_results: IconResults = Rc::new(RefCell::new(Vec::new()));
@@ -173,6 +174,11 @@ fn run(rx: Receiver<CoreRequest>, tx: Sender<CoreEvent>) {
                 // transactions so stale results are never shown after the
                 // installed set changes.
                 let search_cache: Rc<RefCell<Option<SearchCache>>> = Rc::new(RefCell::new(None));
+                // Bumped every time the cache is invalidated (config reload,
+                // transaction). A search task started before the invalidation
+                // would otherwise repopulate the cache with pre-transaction
+                // results when it finishes after it.
+                let cache_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
                 // Flusher: coalesces icon results into batched events so a
                 // flood of completed downloads can never crowd core events
                 // out of the bounded event channel. Ends when the runtime
@@ -202,6 +208,7 @@ fn run(rx: Receiver<CoreRequest>, tx: Sender<CoreEvent>) {
                         // Sources changed: drop cached search results so the
                         // next identical query re-runs against the new config.
                         *search_cache.borrow_mut() = None;
+                        cache_generation.set(cache_generation.get() + 1);
                         if tx.try_send(CoreEvent::ConfigReloaded).is_err() {
                             eprintln!("brim-gui: event channel full or closed; dropping event");
                         }
@@ -256,18 +263,26 @@ fn run(rx: Receiver<CoreRequest>, tx: Sender<CoreEvent>) {
                             | CoreRequest::ImportSync(..)
                     ) {
                         *search_cache.borrow_mut() = None;
+                        cache_generation.set(cache_generation.get() + 1);
                     }
                     let snapshot = manager.borrow().clone();
                     let tx = tx.clone();
                     let search_cache = search_cache.clone();
+                    let cache_generation = cache_generation.clone();
+                    let started_at = cache_generation.get();
                     tokio::task::spawn_local(async move {
-                        let event = handle(request, &snapshot).await;
+                        let event = handle(request, &snapshot, &tx).await;
                         if let CoreEvent::SearchResults(query, packages) = &event {
-                            *search_cache.borrow_mut() = Some(SearchCache {
-                                query: query.clone(),
-                                results: packages.clone(),
-                                at: std::time::Instant::now(),
-                            });
+                            // Cache only when no transaction or config reload
+                            // landed while the search was running; those
+                            // results predate the installed-set change.
+                            if started_at == cache_generation.get() {
+                                *search_cache.borrow_mut() = Some(SearchCache {
+                                    query: query.clone(),
+                                    results: packages.clone(),
+                                    at: std::time::Instant::now(),
+                                });
+                            }
                         }
                         // Bounded channel: drop with a log if the GUI is
                         // somehow 128 events behind.
@@ -288,14 +303,30 @@ fn reload_manager(manager: &RefCell<Rc<PackageManager>>, config: &brim_core::Con
 }
 
 /// Execute one request against the manager and produce the reply event.
-async fn handle(request: CoreRequest, manager: &PackageManager) -> CoreEvent {
+/// Per-backend failures of a partially successful request (updates fetch)
+/// are reported as extra [`CoreEvent::Error`]s on `tx` — the GUI toasts
+/// them, so a broken backend is not invisible.
+async fn handle(
+    request: CoreRequest,
+    manager: &PackageManager,
+    tx: &Sender<CoreEvent>,
+) -> CoreEvent {
     match request {
         CoreRequest::Search(query) => {
             let results = manager.search(&query, None).await;
             CoreEvent::SearchResults(query, results)
         }
         CoreRequest::LoadInstalled => CoreEvent::Installed(manager.list_installed().await),
-        CoreRequest::LoadUpdates => CoreEvent::Updates(manager.updates().await),
+        CoreRequest::LoadUpdates => {
+            let (packages, errors) = manager.updates_with_errors().await;
+            for (source, error) in errors {
+                let event = CoreEvent::Error(format!("{source} backend failed: {error}"));
+                if tx.try_send(event).is_err() {
+                    eprintln!("brim-gui: event channel full or closed; dropping event");
+                }
+            }
+            CoreEvent::Updates(packages)
+        }
         CoreRequest::LoadStats => CoreEvent::Stats(manager.system_stats().await),
         CoreRequest::LoadTrending => CoreEvent::Trending(manager.trending().await),
         CoreRequest::LoadRepos => CoreEvent::Repos(manager.list_repos().await),
@@ -377,15 +408,28 @@ async fn handle(request: CoreRequest, manager: &PackageManager) -> CoreEvent {
         CoreRequest::ExportSyncTo(path) => {
             let json = manager.export_sync().await;
             let label = path.to_string_lossy().into_owned();
-            let result = std::fs::write(&path, json)
+            let result = tokio::fs::write(&path, json)
+                .await
                 .map(|()| label)
                 .map_err(|e| e.to_string());
             CoreEvent::SyncExported(result)
         }
-        CoreRequest::ParseSyncFile(path) => {
-            let text = std::fs::read_to_string(path).unwrap_or_default();
-            CoreEvent::SyncParsed(brim_core::sync::parse_import(&text))
-        }
+        CoreRequest::ParseSyncFile(path) => match tokio::fs::read_to_string(&path).await {
+            Ok(text) => match brim_core::sync::parse_import(&text) {
+                Ok(entries) => CoreEvent::SyncParsed(entries),
+                // A corrupt or too-new sync file is not an empty one: tell
+                // the user instead of showing the misleading "no packages
+                // found" toast.
+                Err(error) => {
+                    CoreEvent::Error(format!("Could not import {}: {error}", path.display()))
+                }
+            },
+            // An unreadable file is not an empty one either.
+            Err(error) => CoreEvent::Error(format!(
+                "Could not read {}: {error}",
+                path.display()
+            )),
+        },
         CoreRequest::ImportSync(entries) => {
             let results = manager.import_sync(entries).await;
             let succeeded = results.iter().filter(|r| r.success).count();
@@ -419,7 +463,8 @@ mod tests {
     async fn search_event_echoes_the_query() {
         // An empty backend set is hermetic: nothing is probed or spawned.
         let manager = PackageManager::with_backends(vec![]);
-        let event = handle(CoreRequest::Search("htop".to_string()), &manager).await;
+        let (tx, _rx) = async_channel::bounded(1);
+        let event = handle(CoreRequest::Search("htop".to_string()), &manager, &tx).await;
         let CoreEvent::SearchResults(query, packages) = event else {
             panic!("expected SearchResults");
         };

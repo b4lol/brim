@@ -2,6 +2,7 @@
 
 mod banner;
 mod prompt;
+mod sanitize;
 mod table;
 
 use brim_core::{
@@ -11,6 +12,7 @@ use brim_core::{
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use sanitize::sanitize;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -20,6 +22,10 @@ use std::time::Duration;
     about = "Brim — the Fedora app store & package manager"
 )]
 struct Cli {
+    /// Print machine-readable JSON instead of tables (search, list,
+    /// info, stats). Implies no banner.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -106,6 +112,12 @@ impl From<SourceArg> for SourceType {
     }
 }
 
+// Exit codes: 0 = success (or user abort), 1 = general/backend error,
+// 2 = package not found, 3 = a transaction ran but reported failure.
+const EXIT_ERROR: i32 = 1;
+const EXIT_NOT_FOUND: i32 = 2;
+const EXIT_TX_FAILED: i32 = 3;
+
 #[tokio::main]
 async fn main() {
     // Rust ignores SIGPIPE at startup, which turns a closed stdout (e.g.
@@ -115,56 +127,79 @@ async fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
-    banner::print_banner();
-    match run(cli).await {
+    // Machine-readable output stays clean; the banner itself is also
+    // suppressed when stdout is not a terminal (see banner.rs).
+    if !cli.json {
+        banner::print_banner();
+    }
+    match run(&cli).await {
         // `false` = a transaction reported failure.
-        Ok(false) => std::process::exit(1),
+        Ok(false) => std::process::exit(EXIT_TX_FAILED),
         Ok(true) => {}
         Err(err) => {
             eprintln!("{}", format!("error: {err}").red().bold());
-            std::process::exit(1);
+            std::process::exit(error_exit_code(&err));
         }
+    }
+}
+
+/// Map an error to its exit code: "package not found" gets its own code
+/// so scripts can tell a miss apart from a broken backend.
+fn error_exit_code(err: &BrimError) -> i32 {
+    match err {
+        BrimError::NotFound(_) => EXIT_NOT_FOUND,
+        _ => EXIT_ERROR,
     }
 }
 
 /// Returns `Ok(false)` when a transaction itself reported failure, so the
 /// single exit-code decision stays in `main`.
-async fn run(cli: Cli) -> Result<bool> {
+async fn run(cli: &Cli) -> Result<bool> {
     // Config subcommands never touch the backends.
-    if let Commands::Config { action } = cli.command {
+    if let Commands::Config { action } = &cli.command {
         return run_config(action);
     }
-    let pm = PackageManager::new();
-    match cli.command {
+    // Async constructor: the sync one would block the tokio executor
+    // while reading the config.
+    let pm = PackageManager::new_async().await;
+    match &cli.command {
         // Handled above, before any backend is constructed.
         Commands::Config { .. } => unreachable!(),
         Commands::Search { query, source } => {
             let pb = spinner(&format!("Searching for '{query}'…"));
-            let pkgs = pm.search(&query, source.map(Into::into)).await;
+            let (pkgs, errors) = pm.search_with_errors(query, source.map(Into::into)).await;
             pb.finish_and_clear();
-            table::print_packages(&pkgs);
+            warn_backends(&errors);
+            if cli.json {
+                print_json(&pkgs)?;
+            } else {
+                table::print_packages(&pkgs);
+            }
         }
         Commands::Install { id, yes, source } => {
             let source = source.map(Into::into);
-            let pkg = resolve(&pm, &id, source).await?;
-            if !yes && !prompt::confirm("Install", &id, Some(&pkg.source.to_string())) {
+            let pkg = resolve(&pm, id, source).await?;
+            if !yes && !prompt::confirm("Install", id, Some(&pkg.source.to_string())) {
                 println!("Aborted.");
                 return Ok(true);
             }
             let pb = spinner(&format!("Installing '{id}'…"));
-            let result = pm.install(&id, source).await;
+            // The resolved package goes straight to the backend: no
+            // second resolve, and no room for the resolution to change
+            // between the prompt and the transaction (TOCTOU).
+            let result = pm.install_package(&pkg).await;
             pb.finish_and_clear();
             return Ok(report_transaction(result?));
         }
         Commands::Remove { id, yes, source } => {
             let source = source.map(Into::into);
-            let pkg = resolve(&pm, &id, source).await?;
-            if !yes && !prompt::confirm("Remove", &id, Some(&pkg.source.to_string())) {
+            let pkg = resolve(&pm, id, source).await?;
+            if !yes && !prompt::confirm("Remove", id, Some(&pkg.source.to_string())) {
                 println!("Aborted.");
                 return Ok(true);
             }
             let pb = spinner(&format!("Removing '{id}'…"));
-            let result = pm.remove(&id, source).await;
+            let result = pm.remove_package(&pkg).await;
             pb.finish_and_clear();
             return Ok(report_transaction(result?));
         }
@@ -180,21 +215,35 @@ async fn run(cli: Cli) -> Result<bool> {
         }
         Commands::List => {
             let pb = spinner("Listing installed packages…");
-            let pkgs = pm.list_installed().await;
+            let (pkgs, errors) = pm.list_installed_with_errors().await;
             pb.finish_and_clear();
-            table::print_packages(&pkgs);
+            warn_backends(&errors);
+            if cli.json {
+                print_json(&pkgs)?;
+            } else {
+                table::print_packages(&pkgs);
+            }
         }
         Commands::Stats => {
             let pb = spinner("Gathering system statistics…");
             let stats = pm.system_stats().await;
             pb.finish_and_clear();
-            table::print_stats(&stats);
+            if cli.json {
+                print_json(&stats)?;
+            } else {
+                table::print_stats(&stats);
+            }
         }
         Commands::Info { id, source } => {
             let pb = spinner(&format!("Fetching info for '{id}'…"));
-            let pkg = pm.info(&id, source.map(Into::into)).await;
+            let pkg = pm.info(id, source.map(Into::into)).await;
             pb.finish_and_clear();
-            print_info(&pkg?);
+            let pkg = pkg?;
+            if cli.json {
+                print_json(&pkg)?;
+            } else {
+                print_info(&pkg);
+            }
         }
     }
     Ok(true)
@@ -202,7 +251,7 @@ async fn run(cli: Cli) -> Result<bool> {
 
 /// Execute a `brim config` subcommand. Always returns `Ok(true)` on
 /// success; unknown keys and bad values are `Err` so `main` exits 1.
-fn run_config(action: ConfigAction) -> Result<bool> {
+fn run_config(action: &ConfigAction) -> Result<bool> {
     match action {
         ConfigAction::List => {
             if !BrimConfig::file_is_valid(&config_path()) {
@@ -218,20 +267,20 @@ fn run_config(action: ConfigAction) -> Result<bool> {
         }
         ConfigAction::Get { key } => {
             let config = BrimConfig::load();
-            match config.get(&key) {
+            match config.get(key) {
                 Some(value) => println!("{value}"),
-                None => return Err(unknown_key(&key)),
+                None => return Err(unknown_key(key)),
             }
         }
         ConfigAction::Set { key, value } => {
-            let Some(value) = parse_bool(&value) else {
+            let Some(value) = parse_bool(value) else {
                 return Err(BrimError::Parse(format!(
                     "invalid value '{value}' (expected true or false)"
                 )));
             };
             let mut config = BrimConfig::load();
-            if !config.set(&key, value) {
-                return Err(unknown_key(&key));
+            if !config.set(key, value) {
+                return Err(unknown_key(key));
             }
             if !BrimConfig::file_is_valid(&config_path()) {
                 eprintln!(
@@ -250,9 +299,10 @@ fn run_config(action: ConfigAction) -> Result<bool> {
     Ok(true)
 }
 
-/// Parse a boolean argument, accepting exactly `true` or `false`.
+/// Parse a boolean argument, accepting `true` or `false` in any casing
+/// (`true`, `True`, `TRUE`).
 fn parse_bool(value: &str) -> Option<bool> {
-    match value {
+    match value.to_ascii_lowercase().as_str() {
         "true" => Some(true),
         "false" => Some(false),
         _ => None,
@@ -265,6 +315,28 @@ fn unknown_key(key: &str) -> BrimError {
         "unknown config key '{key}' (keys: {})",
         BrimConfig::KEYS.join(", ")
     ))
+}
+
+/// Warn on stderr about backends that failed during a fan-out read;
+/// partial results are still shown, so a "No packages found." after
+/// warnings means a genuinely empty result, not a silent backend outage.
+fn warn_backends(errors: &[(SourceType, BrimError)]) {
+    for (source, err) in errors {
+        eprintln!(
+            "{}",
+            format!("warning: {source} backend failed: {err}").yellow()
+        );
+    }
+}
+
+/// Print a value as pretty JSON. The in-house models always serialize,
+/// so a failure here is defensive only; it still propagates as `Err` so
+/// the process exits nonzero instead of reporting success.
+fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|err| BrimError::Parse(format!("failed to encode JSON: {err}")))?;
+    println!("{json}");
+    Ok(())
 }
 
 /// Resolve a package before a transaction so the confirmation prompt can
@@ -290,29 +362,30 @@ fn spinner(message: &str) -> ProgressBar {
     pb
 }
 
-/// Print package details for the `info` command.
+/// Print package details for the `info` command. Untrusted fields are
+/// sanitized so remote metadata cannot inject terminal escape sequences.
 fn print_info(pkg: &Package) {
-    println!("{}", pkg.name.bold());
-    println!("  Version:  {}", pkg.version);
+    println!("{}", sanitize(&pkg.name).bold());
+    println!("  Version:  {}", sanitize(&pkg.version));
     if let Some(installed) = &pkg.installed_version {
-        println!("  Installed: {installed}");
+        println!("  Installed: {}", sanitize(installed));
     }
     println!("  Source:   {}", pkg.source);
     println!("  Status:   {}", pkg.status);
     println!("  Category: {}", pkg.category);
     println!("  Size:     {:.1} MB", pkg.size_mb);
     if let Some(license) = &pkg.license {
-        println!("  License:  {license}");
+        println!("  License:  {}", sanitize(license));
     }
     if let Some(homepage) = &pkg.homepage {
-        println!("  Homepage: {homepage}");
+        println!("  Homepage: {}", sanitize(homepage));
     }
     if !pkg.summary.is_empty() {
-        println!("  Summary:  {}", pkg.summary);
+        println!("  Summary:  {}", sanitize(&pkg.summary));
     }
     if !pkg.description.is_empty() {
         println!();
-        println!("{}", pkg.description.trim());
+        println!("{}", sanitize(pkg.description.trim()));
     }
 }
 
@@ -321,7 +394,10 @@ fn print_info(pkg: &Package) {
 fn report_transaction(result: TransactionResult) -> bool {
     let output = result.output.trim();
     if !output.is_empty() {
-        println!("{output}");
+        // Backend output embeds remote metadata (package/repo names), so
+        // it gets the same control-character stripping as other untrusted
+        // strings.
+        println!("{}", sanitize(output));
     }
     if result.success {
         println!("{}", result.message.green().bold());
@@ -344,6 +420,20 @@ mod tests {
         };
         assert_eq!(query, "htop");
         assert!(matches!(source, Some(SourceArg::Fedora)));
+        assert!(!cli.json);
+    }
+
+    #[test]
+    fn cli_parses_global_json_flag() {
+        use clap::Parser;
+        for args in [
+            vec!["brim", "--json", "list"],
+            vec!["brim", "list", "--json"],
+            vec!["brim", "--json", "search", "htop"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.json);
+        }
     }
 
     #[test]
@@ -421,11 +511,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_bool_accepts_only_true_false() {
+    fn parse_bool_accepts_true_false_any_case() {
         assert_eq!(parse_bool("true"), Some(true));
+        assert_eq!(parse_bool("True"), Some(true));
+        assert_eq!(parse_bool("TRUE"), Some(true));
         assert_eq!(parse_bool("false"), Some(false));
+        assert_eq!(parse_bool("False"), Some(false));
         assert_eq!(parse_bool("yes"), None);
         assert_eq!(parse_bool("1"), None);
+    }
+
+    #[test]
+    fn exit_code_distinguishes_not_found() {
+        assert_eq!(
+            error_exit_code(&BrimError::NotFound("htop".into())),
+            EXIT_NOT_FOUND
+        );
+        assert_eq!(
+            error_exit_code(&BrimError::CommandFailed("boom".into())),
+            EXIT_ERROR
+        );
+        assert_eq!(
+            error_exit_code(&BrimError::BackendUnavailable("dnf5".into())),
+            EXIT_ERROR
+        );
     }
 
     #[test]
@@ -435,5 +544,25 @@ mod tests {
         assert!(report_transaction(ok));
         let failed = TransactionResult::err(TransactionAction::Install, "htop", "boom", "");
         assert!(!report_transaction(failed));
+    }
+
+    #[test]
+    fn print_json_failure_is_an_error() {
+        use serde::ser::{Error as _, Serializer};
+
+        // A value whose serialization always fails, so the defensive
+        // error path in print_json is exercised without subprocesses.
+        struct Failing;
+        impl serde::Serialize for Failing {
+            fn serialize<S: Serializer>(
+                &self,
+                _serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                Err(S::Error::custom("boom"))
+            }
+        }
+
+        assert!(print_json(&Failing).is_err());
+        assert!(print_json(&["htop"]).is_ok());
     }
 }

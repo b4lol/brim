@@ -1,19 +1,46 @@
 //! HTTP request routing for the Brim REST API and embedded SPA.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use brim_core::{PackageManager, SourceType};
+use brim_core::{PackageManager, SourceType, SystemStats};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Body;
 use hyper::header::HeaderValue;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Serialize;
+use tokio::sync::Mutex;
 
 use crate::static_files;
 
 /// Maximum accepted size for a JSON request body.
 const MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// How long a `/api/stats` response is served from the cache.
+const STATS_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Header carrying the per-session API token.
+const TOKEN_HEADER: &str = "x-brim-token";
+
+/// Shared server state passed to every request handler.
+pub struct State {
+    mgr: Arc<PackageManager>,
+    /// Per-session bearer token required on every `/api/*` request.
+    token: Arc<str>,
+    /// Short-lived cache for `/api/stats`; at most one recompute per TTL.
+    stats_cache: Mutex<Option<(Instant, SystemStats)>>,
+}
+
+impl State {
+    pub fn new(mgr: Arc<PackageManager>, token: Arc<str>) -> Self {
+        Self {
+            mgr,
+            token,
+            stats_cache: Mutex::new(None),
+        }
+    }
+}
 
 /// JSON body accepted by `POST /api/install` and `POST /api/remove`.
 ///
@@ -25,29 +52,51 @@ struct PackageRequest {
     source: Option<String>,
 }
 
-/// Handle a single HTTP request against the shared package manager.
+/// Handle a single HTTP request against the shared server state.
 ///
 /// Generic over the body type so tests can drive it with `Full<Bytes>`
 /// while the server passes hyper's `Incoming`.
-pub async fn handle<B>(req: Request<B>, mgr: Arc<PackageManager>) -> Response<Full<Bytes>>
+pub async fn handle<B>(req: Request<B>, state: Arc<State>) -> Response<Full<Bytes>>
 where
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    // DNS-rebinding guard: every request must name a loopback host.
+    if !loopback_host(&req) {
+        return json_error(StatusCode::FORBIDDEN, "forbidden host");
+    }
+
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(str::to_string);
 
+    // Every /api/* endpoint requires the per-session token; static assets
+    // (which cannot change system state) are served without it.
+    if path.starts_with("/api/") && !authorized(&req, &state.token) {
+        return json_error(StatusCode::FORBIDDEN, "missing or invalid token");
+    }
+
     match (method, path.as_str()) {
-        (Method::GET, "/") => {
-            static_response(static_files::INDEX_HTML, "text/html; charset=utf-8", true)
-        }
-        (Method::GET, "/style.css") => static_response(static_files::STYLE_CSS, "text/css", false),
-        (Method::GET, "/app.js") => {
-            static_response(static_files::APP_JS, "application/javascript", false)
-        }
-        (Method::GET, "/api/packages") => packages(mgr, query.as_deref()).await,
-        (Method::GET, "/api/stats") => stats(mgr).await,
+        (Method::GET, "/") => static_response(
+            static_files::INDEX_HTML,
+            "text/html; charset=utf-8",
+            true,
+            "no-cache",
+        ),
+        (Method::GET, "/style.css") => static_response(
+            static_files::STYLE_CSS,
+            "text/css",
+            false,
+            "max-age=300",
+        ),
+        (Method::GET, "/app.js") => static_response(
+            static_files::APP_JS,
+            "application/javascript",
+            false,
+            "max-age=300",
+        ),
+        (Method::GET, "/api/packages") => packages(state.mgr.clone(), query.as_deref()).await,
+        (Method::GET, "/api/stats") => stats(&state).await,
         (Method::POST, "/api/install")
         | (Method::POST, "/api/remove")
         | (Method::POST, "/api/upgrade")
@@ -55,11 +104,71 @@ where
         {
             json_error(StatusCode::FORBIDDEN, "forbidden origin")
         }
-        (Method::POST, "/api/install") => transaction(req, mgr, TransactionKind::Install).await,
-        (Method::POST, "/api/remove") => transaction(req, mgr, TransactionKind::Remove).await,
-        (Method::POST, "/api/upgrade") => upgrade(mgr).await,
+        (Method::POST, "/api/install") => {
+            transaction(req, state.mgr.clone(), TransactionKind::Install).await
+        }
+        (Method::POST, "/api/remove") => {
+            transaction(req, state.mgr.clone(), TransactionKind::Remove).await
+        }
+        (Method::POST, "/api/upgrade") => upgrade(state.mgr.clone()).await,
         _ => json_error(StatusCode::NOT_FOUND, "not found"),
     }
+}
+
+/// Check the per-session token on an `/api/*` request.
+fn authorized<B>(req: &Request<B>, token: &str) -> bool {
+    req.headers()
+        .get(TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|provided| constant_time_eq(provided.as_bytes(), token.as_bytes()))
+}
+
+/// Compare two byte strings in time proportional to their length only.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// DNS-rebinding guard applied to every request.
+///
+/// Browsers send `Host` on every HTTP/1.1 request; a page on an arbitrary
+/// website whose DNS name rebinds to 127.0.0.1 arrives with that site's
+/// `Host` and is rejected. Missing or unparseable values fail closed.
+fn loopback_host<B>(req: &Request<B>) -> bool {
+    let Some(host) = req.headers().get(hyper::header::HOST) else {
+        return false;
+    };
+    let Ok(host) = host.to_str() else {
+        return false;
+    };
+    match host_name(host) {
+        Some(name) => name == "127.0.0.1" || name == "::1" || name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// Extract the host (no port) from a `Host` header value: `host[:port]`,
+/// with IPv6 literals in brackets. Anything else (bare IPv6, non-numeric
+/// ports, empty host) returns `None` so callers fail closed.
+fn host_name(authority: &str) -> Option<&str> {
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let end = bracketed.find(']')?;
+        let rest = &bracketed[end + 1..];
+        (&bracketed[..end], rest.strip_prefix(':').unwrap_or(rest))
+    } else {
+        match authority.split_once(':') {
+            // A second colon means a bare IPv6 literal: fail closed.
+            Some((h, p)) if !h.is_empty() && !p.contains(':') => (h, p),
+            Some(_) => return None,
+            None => (authority, ""),
+        }
+    };
+    if host.is_empty() || (!port.is_empty() && !port.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    Some(host)
 }
 
 /// CSRF guard for state-changing POSTs.
@@ -124,8 +233,21 @@ async fn packages(mgr: Arc<PackageManager>, query: Option<&str>) -> Response<Ful
 }
 
 /// `GET /api/stats` — dashboard statistics across all backends.
-async fn stats(mgr: Arc<PackageManager>) -> Response<Full<Bytes>> {
-    json_response(StatusCode::OK, &mgr.system_stats().await)
+///
+/// Results are cached for `STATS_CACHE_TTL`; the stats walk can be slow
+/// (it shells out to the backends) and the dashboard polls it frequently.
+async fn stats(state: &State) -> Response<Full<Bytes>> {
+    // Holding the lock across the recompute also serializes concurrent
+    // misses, so a burst of polls triggers at most one backend walk.
+    let mut cache = state.stats_cache.lock().await;
+    if let Some((fetched, cached)) = cache.as_ref() {
+        if fetched.elapsed() < STATS_CACHE_TTL {
+            return json_response(StatusCode::OK, cached);
+        }
+    }
+    let fresh = state.mgr.system_stats().await;
+    *cache = Some((Instant::now(), fresh.clone()));
+    json_response(StatusCode::OK, &fresh)
 }
 
 /// Which per-package transaction a `POST` is asking for.
@@ -150,7 +272,14 @@ where
         .await
     {
         Ok(collected) => collected.to_bytes(),
-        Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large"),
+        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
+            return json_error(StatusCode::PAYLOAD_TOO_LARGE, "body too large");
+        }
+        Err(e) => {
+            // Connection/IO failure while reading, not a size violation.
+            eprintln!("failed to read request body: {e}");
+            return json_error(StatusCode::BAD_REQUEST, "could not read request body");
+        }
     };
     let payload: PackageRequest = match serde_json::from_slice(&body) {
         Ok(p) => p,
@@ -236,17 +365,23 @@ fn url_decode(raw: &str) -> String {
 
 /// Build a static-asset response with the given content type.
 ///
-/// `is_html` adds the framing/scripting headers that only the SPA shell needs.
+/// `is_html` adds the framing/scripting headers that only the SPA shell
+/// needs; `cache_control` becomes the `Cache-Control` value.
 fn static_response(
     body: &'static str,
     content_type: &'static str,
     is_html: bool,
+    cache_control: &'static str,
 ) -> Response<Full<Bytes>> {
     let mut resp = Response::new(Full::new(Bytes::from_static(body.as_bytes())));
     let headers = resp.headers_mut();
     headers.insert(
         hyper::header::CONTENT_TYPE,
         HeaderValue::from_static(content_type),
+    );
+    headers.insert(
+        hyper::header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
     );
     add_security_headers(headers, is_html);
     resp
@@ -319,15 +454,22 @@ mod tests {
     use http_body_util::BodyExt;
     use hyper::Method;
 
-    fn manager() -> Arc<PackageManager> {
+    const TEST_TOKEN: &str = "test-token";
+
+    fn state() -> Arc<State> {
         // Hermetic: an empty backend set never shells out to the system.
-        Arc::new(PackageManager::with_backends(vec![]))
+        Arc::new(State::new(
+            Arc::new(PackageManager::with_backends(vec![])),
+            TEST_TOKEN.into(),
+        ))
     }
 
     fn get(uri: &str) -> Request<Full<Bytes>> {
         Request::builder()
             .method(Method::GET)
             .uri(uri)
+            .header(hyper::header::HOST, "127.0.0.1:8080")
+            .header(TOKEN_HEADER, TEST_TOKEN)
             .body(Full::new(Bytes::new()))
             .expect("request")
     }
@@ -338,7 +480,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_stats_returns_json() {
-        let resp = handle(get("/api/stats"), manager()).await;
+        let resp = handle(get("/api/stats"), state()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         let stats: SystemStats = serde_json::from_slice(&body).expect("SystemStats JSON");
@@ -347,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_route_is_404() {
-        let resp = handle(get("/nope"), manager()).await;
+        let resp = handle(get("/nope"), state()).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = body_bytes(resp).await;
         let err: serde_json::Value = serde_json::from_slice(&body).expect("error JSON");
@@ -356,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn packages_without_query_returns_empty_array() {
-        let resp = handle(get("/api/packages"), manager()).await;
+        let resp = handle(get("/api/packages"), state()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         let pkgs: serde_json::Value = serde_json::from_slice(&body).expect("packages JSON");
@@ -365,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn root_serves_spa_html() {
-        let resp = handle(get("/"), manager()).await;
+        let resp = handle(get("/"), state()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         let html = String::from_utf8(body.to_vec()).expect("utf-8");
@@ -393,16 +535,22 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/api/install")
+            .header(hyper::header::HOST, "127.0.0.1:8080")
+            .header(TOKEN_HEADER, TEST_TOKEN)
             .body(Full::new(Bytes::from_static(
                 br#"{"id": "htop", "source": "bogus"}"#,
             )))
             .expect("request");
-        let resp = handle(req, manager()).await;
+        let resp = handle(req, state()).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     fn post(uri: &str, origin: Option<&str>) -> Request<Full<Bytes>> {
-        let mut builder = Request::builder().method(Method::POST).uri(uri);
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(hyper::header::HOST, "127.0.0.1:8080")
+            .header(TOKEN_HEADER, TEST_TOKEN);
         if let Some(origin) = origin {
             builder = builder.header("origin", origin);
         }
@@ -413,7 +561,7 @@ mod tests {
     async fn upgrade_rejects_foreign_origin() {
         let resp = handle(
             post("/api/upgrade", Some("https://evil.example")),
-            manager(),
+            state(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -426,7 +574,7 @@ mod tests {
     async fn install_rejects_foreign_origin() {
         let resp = handle(
             post("/api/install", Some("https://evil.example")),
-            manager(),
+            state(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -440,14 +588,14 @@ mod tests {
             "https://127.0.0.1:8080",
             "https://localhost:8080",
         ] {
-            let resp = handle(post("/api/upgrade", Some(origin)), manager()).await;
+            let resp = handle(post("/api/upgrade", Some(origin)), state()).await;
             assert_ne!(resp.status(), StatusCode::FORBIDDEN, "origin: {origin}");
         }
     }
 
     #[tokio::test]
     async fn upgrade_accepts_missing_origin() {
-        let resp = handle(post("/api/upgrade", None), manager()).await;
+        let resp = handle(post("/api/upgrade", None), state()).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -456,7 +604,7 @@ mod tests {
         // Not 403: with an empty JSON body the handler proceeds to a 400.
         let resp = handle(
             post("/api/install", Some("http://127.0.0.1:8080")),
-            manager(),
+            state(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -464,13 +612,13 @@ mod tests {
 
     #[tokio::test]
     async fn install_accepts_missing_origin() {
-        let resp = handle(post("/api/install", None), manager()).await;
+        let resp = handle(post("/api/install", None), state()).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn remove_rejects_foreign_origin() {
-        let resp = handle(post("/api/remove", Some("https://evil.example")), manager()).await;
+        let resp = handle(post("/api/remove", Some("https://evil.example")), state()).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -479,9 +627,11 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/api/remove")
+            .header(hyper::header::HOST, "127.0.0.1:8080")
+            .header(TOKEN_HEADER, TEST_TOKEN)
             .body(Full::new(Bytes::from_static(br#"{"id": "  "}"#)))
             .expect("request");
-        let resp = handle(req, manager()).await;
+        let resp = handle(req, state()).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -492,11 +642,13 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/api/remove")
+            .header(hyper::header::HOST, "127.0.0.1:8080")
+            .header(TOKEN_HEADER, TEST_TOKEN)
             .body(Full::new(Bytes::from_static(
                 br#"{"id": "htop", "source": "fedora"}"#,
             )))
             .expect("request");
-        let resp = handle(req, manager()).await;
+        let resp = handle(req, state()).await;
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -514,14 +666,14 @@ mod tests {
             "http://127.0.0.1.evil.example",
             "http://localhost.evil.example",
         ] {
-            let resp = handle(post("/api/upgrade", Some(origin)), manager()).await;
+            let resp = handle(post("/api/upgrade", Some(origin)), state()).await;
             assert_eq!(resp.status(), StatusCode::FORBIDDEN, "origin: {origin}");
         }
     }
 
     #[tokio::test]
     async fn upgrade_rejects_garbage_origin() {
-        let resp = handle(post("/api/upgrade", Some("not a url")), manager()).await;
+        let resp = handle(post("/api/upgrade", Some("not a url")), state()).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -533,7 +685,7 @@ mod tests {
             "https://[::1]:8443",
             "http://user@127.0.0.1:8080",
         ] {
-            let resp = handle(post("/api/upgrade", Some(origin)), manager()).await;
+            let resp = handle(post("/api/upgrade", Some(origin)), state()).await;
             assert_eq!(resp.status(), StatusCode::OK, "origin: {origin}");
         }
     }
@@ -558,9 +710,11 @@ mod tests {
             let req = Request::builder()
                 .method(Method::POST)
                 .uri("/api/install")
+                .header(hyper::header::HOST, "127.0.0.1:8080")
+                .header(TOKEN_HEADER, TEST_TOKEN)
                 .body(Full::new(Bytes::from_static(body)))
                 .expect("request");
-            let resp = handle(req, manager()).await;
+            let resp = handle(req, state()).await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
             let body = body_bytes(resp).await;
             let err: serde_json::Value = serde_json::from_slice(&body).expect("error JSON");
@@ -574,15 +728,17 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/api/install")
+            .header(hyper::header::HOST, "127.0.0.1:8080")
+            .header(TOKEN_HEADER, TEST_TOKEN)
             .body(Full::new(Bytes::from(big)))
             .expect("request");
-        let resp = handle(req, manager()).await;
+        let resp = handle(req, state()).await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
     async fn packages_accepts_url_encoded_query() {
-        let resp = handle(get("/api/packages?q=a%20b"), manager()).await;
+        let resp = handle(get("/api/packages?q=a%20b"), state()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         let pkgs: serde_json::Value = serde_json::from_slice(&body).expect("packages JSON");
@@ -596,14 +752,14 @@ mod tests {
             "/api/packages?q=x&source=copr",
             "/api/packages?q=x&source=flatpak",
         ] {
-            let resp = handle(get(uri), manager()).await;
+            let resp = handle(get(uri), state()).await;
             assert_eq!(resp.status(), StatusCode::OK, "uri: {uri}");
         }
     }
 
     #[tokio::test]
     async fn packages_rejects_unknown_source_filter() {
-        let resp = handle(get("/api/packages?q=x&source=bogus"), manager()).await;
+        let resp = handle(get("/api/packages?q=x&source=bogus"), state()).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_bytes(resp).await;
         let err: serde_json::Value = serde_json::from_slice(&body).expect("error JSON");
@@ -612,7 +768,7 @@ mod tests {
 
     #[tokio::test]
     async fn responses_carry_security_headers() {
-        let resp = handle(get("/api/stats"), manager()).await;
+        let resp = handle(get("/api/stats"), state()).await;
         assert_eq!(
             resp.headers()
                 .get("x-content-type-options")
@@ -620,7 +776,7 @@ mod tests {
             "nosniff"
         );
 
-        let resp = handle(get("/"), manager()).await;
+        let resp = handle(get("/"), state()).await;
         let headers = resp.headers();
         assert_eq!(
             headers.get("x-content-type-options").expect("nosniff"),
@@ -633,5 +789,35 @@ mod tests {
             .to_str()
             .expect("csp str")
             .contains("default-src 'self'"));
+    }
+
+    #[tokio::test]
+    async fn api_requires_token() {
+        // A request without the session token never reaches the API.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/stats")
+            .header(hyper::header::HOST, "127.0.0.1:8080")
+            .body(Full::new(Bytes::new()))
+            .expect("request");
+        let resp = handle(req, state()).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn requests_reject_foreign_host() {
+        // DNS-rebinding guard: a non-loopback Host fails closed, even on
+        // token-free routes.
+        for uri in ["/api/stats", "/"] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(hyper::header::HOST, "evil.example")
+                .header(TOKEN_HEADER, TEST_TOKEN)
+                .body(Full::new(Bytes::new()))
+                .expect("request");
+            let resp = handle(req, state()).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "uri: {uri}");
+        }
     }
 }

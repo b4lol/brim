@@ -16,6 +16,10 @@
         Flatpak: { api: "flatpak", label: "Flatpak", badge: "badge-flatpak" },
     };
 
+    // Per-session API token, delivered in the URL fragment by the server
+    // (see main.rs); without it every /api/* call is rejected with 403.
+    const token = new URLSearchParams(location.hash.slice(1)).get("token") || "";
+
     function toast(message, ok) {
         const el = document.createElement("div");
         el.className = "toast glass " + (ok ? "toast-ok" : "toast-err");
@@ -56,6 +60,8 @@
                     : pkg.status === "UpdateAvailable"
                       ? "Update"
                       : "Install";
+            const card = document.createElement("div");
+            card.className = "card glass";
             card.innerHTML =
                 '<div class="card-head">' +
                 '<span class="card-name">' + esc(pkg.name) + "</span>" +
@@ -91,7 +97,9 @@
             return;
         }
         try {
-            const res = await fetch("/api/packages?q=" + encodeURIComponent(query));
+            const res = await fetch("/api/packages?q=" + encodeURIComponent(query), {
+                headers: { "x-brim-token": token },
+            });
             if (!res.ok) throw new Error("HTTP " + res.status);
             renderPackages(await res.json());
         } catch (err) {
@@ -119,7 +127,7 @@
         try {
             const res = await fetch("/api/install", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: { "Content-Type": "application/json", "x-brim-token": token },
                 body: JSON.stringify({ id: pkg.id, source: src.api }),
             });
             const data = await res.json();
@@ -146,7 +154,7 @@
         try {
             const res = await fetch("/api/remove", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: { "Content-Type": "application/json", "x-brim-token": token },
                 body: JSON.stringify({ id: pkg.id, source: src.api }),
             });
             const data = await res.json();
@@ -170,7 +178,10 @@
         upgradeBtn.disabled = true;
         upgradeBtn.textContent = "Upgrading…";
         try {
-            const res = await fetch("/api/upgrade", { method: "POST" });
+            const res = await fetch("/api/upgrade", {
+                method: "POST",
+                headers: { "x-brim-token": token },
+            });
             const data = await res.json();
             toast(data.message || (data.success ? "Upgrade finished" : "Upgrade failed"),
                 res.ok && data.success);
@@ -185,7 +196,7 @@
 
     async function loadStats() {
         try {
-            const res = await fetch("/api/stats");
+            const res = await fetch("/api/stats", { headers: { "x-brim-token": token } });
             if (!res.ok) throw new Error("HTTP " + res.status);
             const stats = await res.json();
             document.getElementById("stat-installed").textContent = stats.installed;

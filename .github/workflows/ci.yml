@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # Weekly, Monday 07:17 UTC — picks up newly published RUSTSEC advisories.
+    - cron: '17 7 * * 1'
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,3 +44,26 @@ jobs:
 
       - name: Release build
         run: cargo build --workspace --release
+
+  audit:
+    name: security (RUSTSEC) + license audit
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit and cargo-deny
+        run: cargo install cargo-audit cargo-deny --locked
+
+      - name: RUSTSEC vulnerability check
+        run: cargo audit
+
+      - name: Dependency license check
+        run: cargo deny check licenses

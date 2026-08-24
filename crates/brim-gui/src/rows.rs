@@ -11,6 +11,7 @@
 //! safe Rust, no GObject data pointers.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use brim_core::{Package, PackageStatus};
@@ -43,8 +44,14 @@ struct RowWidgets {
 type Registry = Rc<RefCell<Vec<Rc<RowWidgets>>>>;
 
 /// Build a virtualized package list and its store. `on_action` runs for
-/// Install/Update/Remove clicks; `on_activate` for row activation.
-pub fn package_list(on_action: ActionFn, on_activate: ActivateFn) -> (ListView, gio::ListStore) {
+/// Install/Update/Remove clicks; `on_activate` for row activation. Rows
+/// whose package id is in `pending_ids` (a transaction is in flight for
+/// them) keep their button insensitive, even after recycling.
+pub fn package_list(
+    on_action: ActionFn,
+    on_activate: ActivateFn,
+    pending_ids: Rc<RefCell<HashSet<String>>>,
+) -> (ListView, gio::ListStore) {
     let store = gio::ListStore::new::<BoxedAnyObject>();
     let selection = SingleSelection::new(Some(store.clone()));
     selection.set_autoselect(false);
@@ -84,7 +91,7 @@ pub fn package_list(on_action: ActionFn, on_activate: ActivateFn) -> (ListView, 
             return;
         };
         *widgets.pkg.borrow_mut() = Some(pkg.clone());
-        bind_row(&widgets, &pkg);
+        bind_row(&widgets, &pkg, &pending_ids.borrow());
     });
 
     let view = ListView::new(Some(selection), Some(factory));
@@ -189,8 +196,9 @@ fn build_row(on_action: ActionFn) -> (Box, RowWidgets) {
     (root, widgets)
 }
 
-/// Fill a recycled row with `pkg`'s data.
-fn bind_row(widgets: &RowWidgets, pkg: &Package) {
+/// Fill a recycled row with `pkg`'s data. The button stays insensitive
+/// while a transaction for this package id is in flight.
+fn bind_row(widgets: &RowWidgets, pkg: &Package, pending_ids: &HashSet<String>) {
     match icons::resolve_immediate(pkg) {
         IconChoice::File(path) => widgets.icon.set_from_file(Some(&path)),
         IconChoice::Theme(name) => widgets.icon.set_icon_name(Some(&name)),
@@ -210,7 +218,7 @@ fn bind_row(widgets: &RowWidgets, pkg: &Package) {
         PackageStatus::Installed => ("Remove", true),
     };
     widgets.button.set_label(label);
-    widgets.button.set_sensitive(true);
+    widgets.button.set_sensitive(!pending_ids.contains(&pkg.id));
     widgets.button.remove_css_class("suggested-action");
     widgets.button.remove_css_class("destructive-action");
     widgets.button.add_css_class(if destructive {

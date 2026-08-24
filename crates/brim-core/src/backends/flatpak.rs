@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use crate::backend::Backend;
-use crate::backends::{probe, QUERY_TIMEOUT};
+use crate::backends::{probe, validate_arg, QUERY_TIMEOUT};
 use crate::error::{BrimError, Result};
 use crate::models::{
     Package, PackageStatus, RepoInfo, RepoKind, SourceType, TransactionAction, TransactionResult,
@@ -40,15 +40,17 @@ impl FlatpakBackend {
             .args(args)
             // Force English output so the parsers see stable headers/fields.
             .env("LC_ALL", "C")
+            // A timed-out query must not leave the flatpak child running.
+            .kill_on_drop(true)
             .output();
         let output = match timeout {
             Some(limit) => match tokio::time::timeout(limit, future).await {
-                Ok(result) => result?,
+                Ok(result) => result.map_err(|e| super::spawn_error("flatpak", e))?,
                 Err(_) => {
                     return Err(BrimError::CommandFailed("flatpak timed out".to_string()));
                 }
             },
-            None => future.await?,
+            None => future.await.map_err(|e| super::spawn_error("flatpak", e))?,
         };
 
         if output.status.success() {
@@ -82,11 +84,14 @@ impl Backend for FlatpakBackend {
     }
 
     async fn search(&self, query: &str) -> Result<Vec<Package>> {
+        validate_arg(query)?;
         let out = self
             .run(
                 &[
                     "search",
                     "--columns=name,description,application,version,branch,remotes",
+                    // `--` keeps user input from being parsed as a flag.
+                    "--",
                     query,
                 ],
                 Some(QUERY_TIMEOUT),
@@ -110,12 +115,14 @@ impl Backend for FlatpakBackend {
     }
 
     async fn info(&self, id: &str) -> Result<Package> {
-        let out = self.run(&["info", id], Some(QUERY_TIMEOUT)).await?;
+        validate_arg(id)?;
+        let out = self.run(&["info", "--", id], Some(QUERY_TIMEOUT)).await?;
         parse_info(&out).ok_or_else(|| BrimError::NotFound(id.to_string()))
     }
 
     async fn install(&self, pkg: &Package) -> Result<TransactionResult> {
         let app_id = pkg.flatpak_ref.as_deref().unwrap_or(&pkg.id);
+        validate_arg(app_id)?;
         let args = install_args(pkg);
         let verb = if args[0] == "update" {
             "updated"
@@ -134,7 +141,8 @@ impl Backend for FlatpakBackend {
 
     async fn remove(&self, pkg: &Package) -> Result<TransactionResult> {
         let app_id = pkg.flatpak_ref.as_deref().unwrap_or(&pkg.id);
-        let out = self.run(&["uninstall", "-y", app_id], None).await?;
+        validate_arg(app_id)?;
+        let out = self.run(&["uninstall", "-y", "--", app_id], None).await?;
         Ok(TransactionResult::ok(
             TransactionAction::Remove,
             app_id,
@@ -180,8 +188,12 @@ impl Backend for FlatpakBackend {
     }
 
     async fn add_repo(&self, id: &str, url: &str) -> Result<TransactionResult> {
+        validate_arg(id)?;
         let out = self
-            .run(&["remote-add", "--user", "--if-not-exists", id, url], None)
+            .run(
+                &["remote-add", "--user", "--if-not-exists", "--", id, url],
+                None,
+            )
             .await?;
         Ok(TransactionResult::ok(
             TransactionAction::RepoChange,
@@ -192,11 +204,23 @@ impl Backend for FlatpakBackend {
     }
 
     async fn remove_repo(&self, id: &str) -> Result<TransactionResult> {
+        validate_arg(id)?;
         // remote-delete defaults to --system; user-level remotes (like the
         // ones add_repo creates) need an explicit --user retry.
-        let out = match self.run(&["remote-delete", id], None).await {
+        let out = match self.run(&["remote-delete", "--", id], None).await {
             Ok(out) => out,
-            Err(_) => self.run(&["remote-delete", "--user", id], None).await?,
+            Err(first) => {
+                self.run(&["remote-delete", "--user", "--", id], None)
+                    .await
+                    // Keep the original error visible: the --user retry
+                    // failing must not mask why the system-level delete
+                    // failed (e.g. a permission problem).
+                    .map_err(|second| {
+                        BrimError::CommandFailed(format!(
+                            "{first}; --user retry also failed: {second}"
+                        ))
+                    })?
+            }
         };
         Ok(TransactionResult::ok(
             TransactionAction::RepoChange,
@@ -287,7 +311,9 @@ pub fn parse_list(output: &str) -> Vec<Package> {
 /// Parse `flatpak remote-ls --updates --columns=application,version`.
 ///
 /// Only the application id and the available version are known, so the id
-/// doubles as the display name.
+/// doubles as the display name. Lines without a TAB-separated version
+/// column are not table rows (noise on stdout) and are skipped, matching
+/// the sibling parsers.
 pub fn parse_updates(output: &str) -> Vec<Package> {
     output
         .lines()
@@ -297,7 +323,7 @@ pub fn parse_updates(output: &str) -> Vec<Package> {
             if app_id.is_empty() {
                 return None;
             }
-            let version = fields.next().unwrap_or("").trim();
+            let version = fields.next()?.trim();
             let mut pkg = Package::new(app_id, app_id, SourceType::Flatpak);
             pkg.version = version.to_string();
             pkg.status = PackageStatus::UpdateAvailable;
@@ -410,13 +436,19 @@ fn install_args(pkg: &Package) -> Vec<String> {
     let app_id = pkg.flatpak_ref.as_deref().unwrap_or(&pkg.id);
     match pkg.status {
         PackageStatus::Installed | PackageStatus::UpdateAvailable => {
-            vec!["update".to_string(), "-y".to_string(), app_id.to_string()]
+            vec![
+                "update".to_string(),
+                "-y".to_string(),
+                "--".to_string(),
+                app_id.to_string(),
+            ]
         }
         PackageStatus::Available => {
             let remote = pkg.flatpak_remote.as_deref().unwrap_or("flathub");
             vec![
                 "install".to_string(),
                 "-y".to_string(),
+                "--".to_string(),
                 remote.to_string(),
                 app_id.to_string(),
             ]
@@ -549,7 +581,7 @@ mod tests {
         let pkg = pkg_with(PackageStatus::Available, Some("fedora"));
         assert_eq!(
             install_args(&pkg),
-            vec!["install", "-y", "fedora", "org.example.App"]
+            vec!["install", "-y", "--", "fedora", "org.example.App"]
         );
     }
 
@@ -558,20 +590,26 @@ mod tests {
         let pkg = pkg_with(PackageStatus::Available, None);
         assert_eq!(
             install_args(&pkg),
-            vec!["install", "-y", "flathub", "org.example.App"]
+            vec!["install", "-y", "--", "flathub", "org.example.App"]
         );
     }
 
     #[test]
     fn install_args_updates_installed_package() {
         let pkg = pkg_with(PackageStatus::Installed, None);
-        assert_eq!(install_args(&pkg), vec!["update", "-y", "org.example.App"]);
+        assert_eq!(
+            install_args(&pkg),
+            vec!["update", "-y", "--", "org.example.App"]
+        );
     }
 
     #[test]
     fn install_args_updates_update_available_package() {
         let pkg = pkg_with(PackageStatus::UpdateAvailable, Some("flathub"));
-        assert_eq!(install_args(&pkg), vec!["update", "-y", "org.example.App"]);
+        assert_eq!(
+            install_args(&pkg),
+            vec!["update", "-y", "--", "org.example.App"]
+        );
     }
 
     // Captured 2026-07-27 from `flatpak remotes --show-disabled

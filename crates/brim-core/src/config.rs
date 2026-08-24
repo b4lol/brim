@@ -95,56 +95,122 @@ impl Config {
         Config::load_from(&config_path())
     }
 
+    /// Async variant of [`Config::load`] for async callers (does not block
+    /// the executor).
+    pub async fn load_async() -> Config {
+        Config::load_from_async(&config_path()).await
+    }
+
     /// Load from `path`. A missing file yields defaults and is created so
     /// the user can see and edit it; an unparseable file yields defaults
     /// without touching the file (the CLI warns about it separately).
+    /// Any other read failure (e.g. permissions) also yields defaults but
+    /// never overwrites the existing file.
     pub fn load_from(path: &Path) -> Config {
         match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let config = Config::default();
                 // Best effort: loading must never fail just because the
                 // file could not be created.
                 let _ = config.save_to(path);
                 config
             }
+            Err(_) => Config::default(),
+        }
+    }
+
+    /// Async variant of [`Config::load_from`].
+    pub async fn load_from_async(path: &Path) -> Config {
+        match tokio::fs::read_to_string(path).await {
+            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let config = Config::default();
+                // Best effort: loading must never fail just because the
+                // file could not be created.
+                let _ = config.save_to_async(path).await;
+                config
+            }
+            Err(_) => Config::default(),
         }
     }
 
     /// Whether `path` holds a parseable config. A missing file counts as
-    /// valid (defaults will be written on load; nothing to warn about).
+    /// valid (defaults will be written on load; nothing to warn about);
+    /// an unreadable one does not (the file exists but cannot be used).
     pub fn file_is_valid(path: &Path) -> bool {
         match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str::<Config>(&text).is_ok(),
-            Err(_) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+
+    /// Async variant of [`Config::file_is_valid`].
+    pub async fn file_is_valid_async(path: &Path) -> bool {
+        match tokio::fs::read_to_string(path).await {
+            Ok(text) => serde_json::from_str::<Config>(&text).is_ok(),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
         }
     }
 
     /// Save to the shared config file (see [`Config::save_to`]).
+    ///
+    /// Refuses to write when no config directory can be determined
+    /// (neither `XDG_CONFIG_HOME` nor `HOME` set): the `/tmp` read-side
+    /// fallback must never become a write target.
     pub fn save(&self) -> Result<()> {
-        self.save_to(&config_path())
+        let path = writable_config_path()?;
+        self.save_to(&path)
+    }
+
+    /// Async variant of [`Config::save`].
+    pub async fn save_async(&self) -> Result<()> {
+        let path = writable_config_path()?;
+        self.save_to_async(&path).await
     }
 
     /// Save to `path` atomically (temp file + rename), creating parent
     /// directories as needed.
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp = path.with_extension("json.tmp");
         let text = serde_json::to_string_pretty(self).expect("Config serialization cannot fail");
-        std::fs::write(&tmp, text)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        crate::fsutil::write_atomic_blocking(path, &text)
+    }
+
+    /// Async variant of [`Config::save_to`].
+    pub async fn save_to_async(&self, path: &Path) -> Result<()> {
+        let text = serde_json::to_string_pretty(self).expect("Config serialization cannot fail");
+        crate::fsutil::write_atomic(path, &text).await
     }
 }
 
-/// The path of the shared config file.
-pub fn config_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+/// The config directory base, when it can be determined.
+fn config_base() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+}
+
+/// The path the write side uses; an error when no config directory can be
+/// determined (no silent `/tmp` fallback on writes).
+fn writable_config_path() -> Result<PathBuf> {
+    config_base()
+        .map(|base| base.join("brim").join("config.json"))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "cannot determine config directory: neither XDG_CONFIG_HOME nor HOME is set",
+            )
+            .into()
+        })
+}
+
+/// The path of the shared config file.
+///
+/// Read-side only: when neither `XDG_CONFIG_HOME` nor `HOME` is set this
+/// falls back to `/tmp` so reads degrade gracefully; writes go through
+/// [`Config::save`], which refuses in that case.
+pub fn config_path() -> PathBuf {
+    let base = config_base().unwrap_or_else(|| PathBuf::from("/tmp"));
     base.join("brim").join("config.json")
 }
 
@@ -176,6 +242,22 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not json");
         assert!(!Config::file_is_valid(&path));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unreadable_file_yields_defaults_and_is_never_overwritten() {
+        // A directory as the config path fails to read on any platform and
+        // for any user (including root): load must yield defaults without
+        // attempting to write over it or leaving a temp file behind.
+        let path = temp_path("unreadable.json");
+        std::fs::create_dir(&path).unwrap();
+        let tmp = path.with_file_name("unreadable.json.tmp");
+        let config = Config::load_from(&path);
+        assert_eq!(config, Config::default());
+        assert!(path.is_dir());
+        assert!(!tmp.exists());
+        assert!(!Config::file_is_valid(&path));
+        let _ = std::fs::remove_dir(&path);
     }
 
     #[test]
@@ -216,6 +298,17 @@ mod tests {
         config.gui.icon_downloads = false;
         config.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path), config);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn async_save_load_round_trip() {
+        let path = temp_path("async-roundtrip.json");
+        let mut config = Config::default();
+        config.sources.dnf5 = false;
+        config.save_to_async(&path).await.unwrap();
+        assert_eq!(Config::load_from_async(&path).await, config);
+        assert!(Config::file_is_valid_async(&path).await);
         let _ = std::fs::remove_file(&path);
     }
 

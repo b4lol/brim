@@ -17,6 +17,9 @@ pub enum BrimError {
     /// The requested package does not exist.
     #[error("package not found: {0}")]
     NotFound(String),
+    /// User-supplied input was rejected before reaching a backend.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     /// An HTTP request failed (network error or non-2xx status).
     #[error("http error: {0}")]
     Http(String),

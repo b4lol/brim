@@ -19,23 +19,52 @@ const POPULAR_URL: &str = "https://flathub.org/api/v2/collection/popular";
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Fetch the trending list: fresh cache → network → stale cache → empty.
+///
+/// A fresh cache that parses to an empty list counts as a miss (treated as
+/// corrupt): otherwise a truncated cache file would pin the UI to an empty
+/// trending page for a full TTL. When no cache directory is available (no
+/// `XDG_CACHE_HOME` and no `HOME`), caching is skipped entirely rather than
+/// falling back to a shared location like `/tmp`.
 pub async fn trending(client: &reqwest::Client) -> Vec<Package> {
     let path = cache_file();
-    if cache_is_fresh(&path) {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            return parse_popular(&text);
+    if let Some(path) = &path {
+        if cache_is_fresh(path).await {
+            if let Ok(text) = tokio::fs::read_to_string(path).await {
+                let cached = parse_popular(&text);
+                if !cached.is_empty() {
+                    return cached;
+                }
+            }
         }
     }
     match crate::http::get_text(client, POPULAR_URL).await {
         Ok(text) => {
-            let _ = write_cache(&path, &text);
-            parse_popular(&text)
+            let parsed = parse_popular(&text);
+            if parsed.is_empty() {
+                // An unparseable 2xx body (error page, endpoint shape
+                // change) must not clobber a usable cache.
+                return read_stale_cache(path.as_deref()).await;
+            }
+            if let Some(path) = &path {
+                let _ = write_cache(path, &text).await;
+            }
+            parsed
         }
-        Err(_) => std::fs::read_to_string(&path)
-            .ok()
-            .map(|text| parse_popular(&text))
-            .unwrap_or_default(),
+        Err(_) => read_stale_cache(path.as_deref()).await,
     }
+}
+
+/// Last resort: whatever the cache holds, parsed (empty when there is no
+/// cache path, or the file is missing, unreadable, or unparseable).
+async fn read_stale_cache(path: Option<&Path>) -> Vec<Package> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    tokio::fs::read_to_string(path)
+        .await
+        .ok()
+        .map(|text| parse_popular(&text))
+        .unwrap_or_default()
 }
 
 /// Parse the popular-collection response into packages (pure, total).
@@ -114,8 +143,8 @@ fn map_category(flathub: &str) -> Category {
 }
 
 /// Whether the cache file exists and is younger than the TTL.
-pub fn cache_is_fresh(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
+pub async fn cache_is_fresh(path: &Path) -> bool {
+    let Ok(metadata) = tokio::fs::metadata(path).await else {
         return false;
     };
     let Ok(modified) = metadata.modified() else {
@@ -127,22 +156,20 @@ pub fn cache_is_fresh(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Write the raw response to the cache file (parent dirs created).
-pub fn write_cache(path: &Path, text: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, text)?;
-    Ok(())
+/// Write the raw response to the cache file atomically (parent dirs
+/// created).
+pub async fn write_cache(path: &Path, text: &str) -> Result<()> {
+    crate::fsutil::write_atomic(path, text).await
 }
 
-/// The trending cache path (`~/.cache/brim/trending.json`).
-fn cache_file() -> PathBuf {
+/// The trending cache path (`~/.cache/brim/trending.json`), or `None`
+/// when no per-user cache directory can be determined. Unlike a `/tmp`
+/// fallback, `None` cannot be squatted by another local user.
+fn cache_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("brim").join("trending.json")
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(base.join("brim").join("trending.json"))
 }
 
 #[cfg(test)]
@@ -351,14 +378,14 @@ mod tests {
         assert!(parse_popular(r#"{"hits": "nope"}"#).is_empty());
     }
 
-    #[test]
-    fn cache_round_trip_and_freshness() {
+    #[tokio::test]
+    async fn cache_round_trip_and_freshness() {
         let path =
-            std::env::temp_dir().join(format!("brim-trending-test-{}.json", std::process::id()));
+            std::env::temp_dir().join(format!("brim-test-{}-trending.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        assert!(!cache_is_fresh(&path));
-        write_cache(&path, POPULAR_OUT).unwrap();
-        assert!(cache_is_fresh(&path));
+        assert!(!cache_is_fresh(&path).await);
+        write_cache(&path, POPULAR_OUT).await.unwrap();
+        assert!(cache_is_fresh(&path).await);
         assert_eq!(
             parse_popular(&std::fs::read_to_string(&path).unwrap()).len(),
             3

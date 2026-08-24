@@ -24,9 +24,48 @@ pub fn confirm(action: &str, target: &str, source: Option<&str>) -> bool {
     );
     let _ = io::stderr().flush();
 
+    read_confirmation(io::stdin().lock())
+}
+
+/// Read one line from `reader`; only an explicit `y`/`yes` confirms.
+/// Split from the prompt so the decision logic is testable without a
+/// real stdin.
+fn read_confirmation<R: BufRead>(mut reader: R) -> bool {
     let mut line = String::new();
-    match io::stdin().lock().read_line(&mut line) {
+    match reader.read_line(&mut line) {
         Ok(_) => matches!(line.trim().to_lowercase().as_str(), "y" | "yes"),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn answer(input: &str) -> bool {
+        read_confirmation(Cursor::new(input.to_string()))
+    }
+
+    #[test]
+    fn accepts_y_and_yes_case_insensitively() {
+        assert!(answer("y\n"));
+        assert!(answer("Y\n"));
+        assert!(answer("yes\n"));
+        assert!(answer("YES\n"));
+        assert!(answer("  yes  \n"));
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        assert!(!answer("n\n"));
+        assert!(!answer("no\n"));
+        assert!(!answer("yep\n"));
+        assert!(!answer("\n"));
+    }
+
+    #[test]
+    fn treats_eof_as_no() {
+        assert!(!answer(""));
     }
 }

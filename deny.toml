@@ -1,0 +1,27 @@
+# cargo-deny configuration. The project is GPL-2.0-only; the license check
+# below only permits GPLv2-compatible dependency licenses.
+#
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = false
+
+[licenses]
+# Note: plain "Apache-2.0" is only compatible with GPLv3, not GPLv2. It is
+# kept in this allow-list pragmatically (most of the Rust ecosystem is
+# dual-licensed MIT OR Apache-2.0), but a dependency licensed *only* under
+# Apache-2.0 should be treated with care.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "GPL-2.0",
+    "GPL-3.0",
+]

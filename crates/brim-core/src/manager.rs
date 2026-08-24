@@ -6,6 +6,7 @@
 //! failures: a broken backend yields partial results, never a panic.
 
 use futures::future::join_all;
+use tokio::sync::Mutex;
 
 use crate::backend::Backend;
 use crate::backends::{copr::CoprBackend, dnf5::Dnf5Backend, flatpak::FlatpakBackend};
@@ -21,6 +22,10 @@ use crate::Result;
 pub struct PackageManager {
     backends: Vec<Box<dyn Backend>>,
     http: reqwest::Client,
+    /// Serializes transactions (install/remove/upgrade): concurrent
+    /// requests (e.g. from the web API) must never spawn two package
+    /// manager processes mutating the system at once.
+    tx_lock: Mutex<()>,
 }
 
 impl Default for PackageManager {
@@ -34,8 +39,18 @@ impl PackageManager {
     /// config: a disabled source's backend is never constructed, so
     /// fan-out reads skip it entirely and transactions targeting it fail
     /// routing like any unknown source.
+    ///
+    /// This constructor reads the config synchronously; async callers
+    /// (frontends on a tokio runtime) should use
+    /// [`PackageManager::new_async`] so the executor is never blocked.
     pub fn new() -> Self {
         Self::from_config(&crate::config::Config::load())
+    }
+
+    /// Async variant of [`PackageManager::new`] for callers already on a
+    /// tokio runtime.
+    pub async fn new_async() -> Self {
+        Self::from_config(&crate::config::Config::load_async().await)
     }
 
     /// Create a manager over the standard backends enabled in `config`.
@@ -58,60 +73,120 @@ impl PackageManager {
         PackageManager {
             backends,
             http: crate::http::client(),
+            tx_lock: Mutex::new(()),
         }
     }
 
     /// Search all available backends concurrently and merge the results.
     ///
     /// When `source` is `Some`, only that backend is queried. Failed
-    /// backends are skipped. Results are sorted: exact-name matches to
+    /// backends are skipped (use [`PackageManager::search_with_errors`] to
+    /// observe their errors). Results are sorted: exact-name matches to
     /// `query` first, then by rating descending, then by name ascending.
     pub async fn search(&self, query: &str, source: Option<SourceType>) -> Vec<Package> {
+        self.search_with_errors(query, source).await.0
+    }
+
+    /// Like [`PackageManager::search`], but also reports per-backend
+    /// errors so callers can tell "no results" apart from "every backend
+    /// failed". Each error is paired with the source that produced it.
+    pub async fn search_with_errors(
+        &self,
+        query: &str,
+        source: Option<SourceType>,
+    ) -> (Vec<Package>, Vec<(SourceType, BrimError)>) {
         let backends = self.active_backends(source).await;
         let results = join_all(backends.iter().map(|b| b.search(query))).await;
-        let mut packages: Vec<Package> = results
-            .into_iter()
-            .filter_map(std::result::Result::ok)
-            .flatten()
-            .collect();
+        let (mut packages, errors) = split_results(backends, results);
         sort_search_results(query, &mut packages);
-        packages
+        (packages, errors)
     }
 
     /// List installed packages across all available backends.
+    ///
+    /// Failed backends are skipped (use
+    /// [`PackageManager::list_installed_with_errors`] to observe their
+    /// errors).
     pub async fn list_installed(&self) -> Vec<Package> {
+        self.list_installed_with_errors().await.0
+    }
+
+    /// Like [`PackageManager::list_installed`], but also reports
+    /// per-backend errors.
+    pub async fn list_installed_with_errors(&self) -> (Vec<Package>, Vec<(SourceType, BrimError)>) {
         let backends = self.active_backends(None).await;
         let results = join_all(backends.iter().map(|b| b.list_installed())).await;
-        merge_sorted(results)
+        let (mut packages, errors) = split_results(backends, results);
+        packages.sort_by(|a, b| a.name.cmp(&b.name));
+        (packages, errors)
     }
 
     /// List packages with pending updates across all available backends.
+    ///
+    /// Failed backends are skipped (use
+    /// [`PackageManager::updates_with_errors`] to observe their errors).
     pub async fn updates(&self) -> Vec<Package> {
+        self.updates_with_errors().await.0
+    }
+
+    /// Like [`PackageManager::updates`], but also reports per-backend
+    /// errors so callers can tell "no updates" apart from "a backend
+    /// failed and its updates are invisible".
+    pub async fn updates_with_errors(&self) -> (Vec<Package>, Vec<(SourceType, BrimError)>) {
         let backends = self.active_backends(None).await;
         let results = join_all(backends.iter().map(|b| b.updates())).await;
-        merge_sorted(results)
+        let (mut packages, errors) = split_results(backends, results);
+        packages.sort_by(|a, b| a.name.cmp(&b.name));
+        (packages, errors)
     }
 
     /// Get package details; the first backend hit wins.
+    ///
+    /// [`BrimError::NotFound`] is returned only when every backend reports
+    /// the package as genuinely unknown; when some backend failed for
+    /// another reason (network, broken tool), the last such error is
+    /// returned instead so a broken backend is never disguised as a miss.
     pub async fn info(&self, id: &str, source: Option<SourceType>) -> Result<Package> {
+        let mut last_backend_error: Option<BrimError> = None;
         for backend in self.active_backends(source).await {
-            if let Ok(pkg) = backend.info(id).await {
-                return Ok(pkg);
+            match backend.info(id).await {
+                Ok(pkg) => return Ok(pkg),
+                Err(BrimError::NotFound(_)) => {}
+                Err(e) => last_backend_error = Some(e),
             }
         }
-        Err(BrimError::NotFound(id.to_string()))
+        match last_backend_error {
+            Some(e) => Err(e),
+            None => Err(BrimError::NotFound(id.to_string())),
+        }
     }
 
     /// Install a package, routing to the backend that owns it.
     pub async fn install(&self, id: &str, source: Option<SourceType>) -> Result<TransactionResult> {
         let pkg = self.resolve(id, source).await?;
-        self.backend_for(pkg.source).await?.install(&pkg).await
+        self.install_package(&pkg).await
+    }
+
+    /// Install an already-resolved package (skips the redundant
+    /// [`PackageManager::resolve`] round-trip frontends would otherwise
+    /// trigger). Transactions are serialized: a concurrent install,
+    /// remove, or upgrade waits for this one to finish.
+    pub async fn install_package(&self, pkg: &Package) -> Result<TransactionResult> {
+        let _guard = self.tx_lock.lock().await;
+        self.backend_for(pkg.source).await?.install(pkg).await
     }
 
     /// Remove an installed package, routing to the backend that owns it.
     pub async fn remove(&self, id: &str, source: Option<SourceType>) -> Result<TransactionResult> {
         let pkg = self.resolve(id, source).await?;
-        self.backend_for(pkg.source).await?.remove(&pkg).await
+        self.remove_package(&pkg).await
+    }
+
+    /// Remove an already-resolved package (see
+    /// [`PackageManager::install_package`]).
+    pub async fn remove_package(&self, pkg: &Package) -> Result<TransactionResult> {
+        let _guard = self.tx_lock.lock().await;
+        self.backend_for(pkg.source).await?.remove(pkg).await
     }
 
     /// List repositories across all available backends (flatpak remotes
@@ -177,8 +252,10 @@ impl PackageManager {
     /// Upgrade packages on all available backends and merge the output.
     ///
     /// Every backend is attempted even if some fail; the merged result is
-    /// successful only if all backends succeeded.
+    /// successful only if all backends succeeded. Transactions are
+    /// serialized against installs and removes.
     pub async fn upgrade(&self) -> Result<TransactionResult> {
+        let _guard = self.tx_lock.lock().await;
         let backends = self.active_backends(None).await;
         let results = join_all(backends.iter().map(|b| b.upgrade())).await;
 
@@ -268,11 +345,17 @@ impl PackageManager {
     pub async fn trending(&self) -> Vec<Package> {
         let (mut trending, installed) =
             tokio::join!(crate::trending::trending(&self.http), self.list_installed());
+        let installed_refs: std::collections::HashSet<&str> = installed
+            .iter()
+            .filter(|p| p.source == SourceType::Flatpak)
+            .flat_map(|p| {
+                [Some(p.id.as_str()), p.flatpak_ref.as_deref()]
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
         for pkg in &mut trending {
-            if installed.iter().any(|p| {
-                p.source == SourceType::Flatpak
-                    && (p.flatpak_ref.as_deref() == Some(pkg.id.as_str()) || p.id == pkg.id)
-            }) {
+            if installed_refs.contains(pkg.id.as_str()) {
                 pkg.status = PackageStatus::Installed;
             }
         }
@@ -304,16 +387,21 @@ impl PackageManager {
     }
 }
 
-/// Merge per-backend list results, skipping failures, sorted by name for
-/// deterministic output.
-fn merge_sorted(results: Vec<Result<Vec<Package>>>) -> Vec<Package> {
-    let mut packages: Vec<Package> = results
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .flatten()
-        .collect();
-    packages.sort_by(|a, b| a.name.cmp(&b.name));
-    packages
+/// Split per-backend list results into merged packages and per-backend
+/// errors, preserving backend order for both.
+fn split_results(
+    backends: Vec<&dyn Backend>,
+    results: Vec<Result<Vec<Package>>>,
+) -> (Vec<Package>, Vec<(SourceType, BrimError)>) {
+    let mut packages = Vec::new();
+    let mut errors = Vec::new();
+    for (backend, result) in backends.into_iter().zip(results) {
+        match result {
+            Ok(pkgs) => packages.extend(pkgs),
+            Err(e) => errors.push((backend.source(), e)),
+        }
+    }
+    (packages, errors)
 }
 
 /// Sort search hits: exact-name matches first, then rating descending,
@@ -673,9 +761,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_returns_not_found_when_backend_is_broken() {
+    async fn install_surfaces_backend_error_when_backend_is_broken() {
         let mut flatpak = MockBackend::new(SourceType::Flatpak);
-        flatpak.fail = true; // a broken backend must surface as a plain miss
+        flatpak.fail = true; // a broken backend must surface its real error
 
         let mgr = PackageManager::with_backends(vec![Box::new(flatpak)]);
         let err = mgr
@@ -683,7 +771,158 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, BrimError::NotFound(_)));
+        assert!(matches!(err, BrimError::CommandFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn info_returns_backend_error_when_not_a_real_miss() {
+        // A network/tool failure must not be disguised as NotFound.
+        let mut dnf = MockBackend::new(SourceType::FedoraOfficial);
+        dnf.fail = true;
+
+        let mgr = PackageManager::with_backends(vec![Box::new(dnf)]);
+        let err = mgr.info("htop", None).await.unwrap_err();
+
+        assert!(matches!(err, BrimError::CommandFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn search_with_errors_reports_failing_backends() {
+        let mut dnf = MockBackend::new(SourceType::FedoraOfficial);
+        dnf.search_results = vec![pkg("ripgrep", SourceType::FedoraOfficial)];
+
+        let mut flatpak = MockBackend::new(SourceType::Flatpak);
+        flatpak.fail = true;
+
+        let mgr = PackageManager::with_backends(vec![Box::new(dnf), Box::new(flatpak)]);
+        let (packages, errors) = mgr.search_with_errors("ripgrep", None).await;
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, SourceType::Flatpak);
+        assert!(matches!(errors[0].1, BrimError::CommandFailed(_)));
+        // The plain search keeps working over partial results.
+        assert_eq!(mgr.search("ripgrep", None).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_installed_with_errors_reports_failing_backends() {
+        let mut dnf = MockBackend::new(SourceType::FedoraOfficial);
+        dnf.installed = vec![pkg("htop", SourceType::FedoraOfficial)];
+
+        let mut flatpak = MockBackend::new(SourceType::Flatpak);
+        flatpak.fail = true;
+
+        let mgr = PackageManager::with_backends(vec![Box::new(dnf), Box::new(flatpak)]);
+        let (packages, errors) = mgr.list_installed_with_errors().await;
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, SourceType::Flatpak);
+        assert_eq!(mgr.list_installed().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn install_package_skips_resolve() {
+        // A frontend that already resolved the package must not pay for a
+        // second resolve: info/search stay untouched.
+        let mut flatpak = MockBackend::new(SourceType::Flatpak);
+        flatpak.info_not_found = true; // resolve would fail here
+        let searches = flatpak.search_calls.clone();
+        let installs = flatpak.install_calls.clone();
+
+        let mgr = PackageManager::with_backends(vec![Box::new(flatpak)]);
+        let result = mgr
+            .install_package(&pkg("org.example.App", SourceType::Flatpak))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert_eq!(installs.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(searches.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// Backend whose transactions sleep so lock contention is observable.
+    struct SlowBackend {
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Backend for SlowBackend {
+        fn source(&self) -> SourceType {
+            SourceType::Flatpak
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn search(&self, _query: &str) -> Result<Vec<Package>> {
+            Ok(vec![])
+        }
+
+        async fn list_installed(&self) -> Result<Vec<Package>> {
+            Ok(vec![])
+        }
+
+        async fn info(&self, id: &str) -> Result<Package> {
+            Err(BrimError::NotFound(id.to_string()))
+        }
+
+        async fn install(&self, pkg: &Package) -> Result<TransactionResult> {
+            let n = self.in_flight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(n, AtomicOrdering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            self.in_flight.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(TransactionResult::ok(
+                TransactionAction::Install,
+                pkg.id.clone(),
+                "installed",
+                "",
+            ))
+        }
+
+        async fn remove(&self, pkg: &Package) -> Result<TransactionResult> {
+            Ok(TransactionResult::ok(
+                TransactionAction::Remove,
+                pkg.id.clone(),
+                "removed",
+                "",
+            ))
+        }
+
+        async fn updates(&self) -> Result<Vec<Package>> {
+            Ok(vec![])
+        }
+
+        async fn upgrade(&self) -> Result<TransactionResult> {
+            Ok(TransactionResult::ok(
+                TransactionAction::Upgrade,
+                "*",
+                "upgraded",
+                "",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn transactions_are_serialized() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let backend = SlowBackend {
+            in_flight: in_flight.clone(),
+            max_in_flight: max_in_flight.clone(),
+        };
+        let mgr = PackageManager::with_backends(vec![Box::new(backend)]);
+        let p = pkg("org.example.App", SourceType::Flatpak);
+
+        let (a, b) = tokio::join!(mgr.install_package(&p), mgr.install_package(&p));
+
+        a.unwrap();
+        b.unwrap();
+        // The two installs ran one after another, never concurrently.
+        assert_eq!(max_in_flight.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[tokio::test]

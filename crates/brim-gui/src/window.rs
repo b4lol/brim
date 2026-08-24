@@ -7,6 +7,7 @@
 //! independently and never assumes a previous event has landed.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -83,7 +84,10 @@ pub fn build(app: &adw::Application) {
     // Transaction pending state: buttons disabled while their transaction is
     // in flight, re-enabled on TransactionDone. Row buttons are tracked in
     // `pending_buttons`; successful transactions also refill the lists.
+    // `pending_ids` tracks the package ids themselves so a recycled row
+    // (rebind) keeps its button insensitive while its transaction runs.
     let pending_buttons: Rc<RefCell<Vec<Button>>> = Rc::new(RefCell::new(Vec::new()));
+    let pending_ids: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
     let upgrade_in_flight = Rc::new(Cell::new(false));
 
     // The shared config, loaded once; Settings switches mutate and save it.
@@ -94,10 +98,13 @@ pub fn build(app: &adw::Application) {
     let on_action: rows::ActionFn = {
         let tx = request_tx.clone();
         let pending = pending_buttons.clone();
+        let pending_ids = pending_ids.clone();
         // Remove confirmations are presented on the window, not the clicked
         // button: dialog buttons die with the closing detail dialog.
         let alert_parent = window.clone();
-        Rc::new(move |pkg, button| handle_row_action(pkg, button, &alert_parent, &tx, &pending))
+        Rc::new(move |pkg, button| {
+            handle_row_action(pkg, button, &alert_parent, &tx, &pending, &pending_ids)
+        })
     };
     let on_activate: rows::ActivateFn = {
         let window = window.clone();
@@ -117,6 +124,7 @@ pub fn build(app: &adw::Application) {
         "emblem-favorite-symbolic",
         on_action.clone(),
         on_activate.clone(),
+        pending_ids.clone(),
     );
     let (updates_store, updates_page, stats_label, upgrade_all) = updates_page(
         &stack,
@@ -124,6 +132,7 @@ pub fn build(app: &adw::Application) {
         &upgrade_in_flight,
         on_action.clone(),
         on_activate.clone(),
+        pending_ids.clone(),
     );
     let (installed_store, installed_page) = installed_page(
         &stack,
@@ -131,6 +140,7 @@ pub fn build(app: &adw::Application) {
         &window,
         on_action.clone(),
         on_activate.clone(),
+        pending_ids.clone(),
     );
     let (spotlight_store, spotlight_page) = flow_page(
         &stack,
@@ -139,6 +149,7 @@ pub fn build(app: &adw::Application) {
         "starred-symbolic",
         on_action.clone(),
         on_activate.clone(),
+        pending_ids.clone(),
     );
     settings_page(&stack, &request_tx, &shared_config);
     // Repositories page: flatpak remotes and COPR repos as preferences
@@ -220,6 +231,7 @@ pub fn build(app: &adw::Application) {
         let last_query = last_query.clone();
         let tx = request_tx.clone();
         let pending_buttons = pending_buttons.clone();
+        let pending_ids = pending_ids.clone();
         let upgrade_in_flight = upgrade_in_flight.clone();
         let shared_config = shared_config.clone();
         let repos_groups = repos_groups.clone();
@@ -349,6 +361,7 @@ pub fn build(app: &adw::Application) {
                             for button in pending_buttons.borrow_mut().drain(..) {
                                 button.set_sensitive(true);
                             }
+                            pending_ids.borrow_mut().clear();
                             upgrade_in_flight.set(false);
                             upgrade_all.set_sensitive(true);
                             // Failure toasts append the command output only
@@ -432,8 +445,9 @@ fn flow_page(
     icon: &str,
     on_action: rows::ActionFn,
     on_activate: rows::ActivateFn,
+    pending_ids: Rc<RefCell<HashSet<String>>>,
 ) -> (gio::ListStore, gtk4::Stack) {
-    let (view, store) = rows::package_list(on_action, on_activate);
+    let (view, store) = rows::package_list(on_action, on_activate, pending_ids);
     let scroll = ScrolledWindow::builder()
         .child(&view)
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -456,6 +470,7 @@ fn updates_page(
     upgrade_in_flight: &Rc<Cell<bool>>,
     on_action: rows::ActionFn,
     on_activate: rows::ActivateFn,
+    pending_ids: Rc<RefCell<HashSet<String>>>,
 ) -> (gio::ListStore, gtk4::Stack, Label, Button) {
     let page = Box::new(Orientation::Vertical, 0);
 
@@ -492,11 +507,13 @@ fn updates_page(
             let btn = button.clone();
             dialog.connect_response(None, move |_, response| {
                 if response == "upgrade" {
-                    in_flight.set(true);
-                    btn.set_sensitive(false);
                     if tx.try_send(CoreRequest::Upgrade).is_err() {
                         eprintln!("brim-gui: request channel full or closed; dropping upgrade");
+                        // Not queued: leave the button usable.
+                        return;
                     }
+                    in_flight.set(true);
+                    btn.set_sensitive(false);
                 }
             });
             dialog.present(Some(button));
@@ -505,7 +522,7 @@ fn updates_page(
     bar.append(&upgrade_all);
     page.append(&bar);
 
-    let (view, store) = rows::package_list(on_action, on_activate);
+    let (view, store) = rows::package_list(on_action, on_activate, pending_ids);
     let scroll = ScrolledWindow::builder()
         .child(&view)
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -543,6 +560,7 @@ fn installed_page(
     window: &ApplicationWindow,
     on_action: rows::ActionFn,
     on_activate: rows::ActivateFn,
+    pending_ids: Rc<RefCell<HashSet<String>>>,
 ) -> (gio::ListStore, gtk4::Stack) {
     let page = Box::new(Orientation::Vertical, 0);
 
@@ -606,7 +624,7 @@ fn installed_page(
     bar.append(&import_button);
     page.append(&bar);
 
-    let (view, store) = rows::package_list(on_action, on_activate);
+    let (view, store) = rows::package_list(on_action, on_activate, pending_ids);
     let scroll = ScrolledWindow::builder()
         .child(&view)
         .hscrollbar_policy(gtk4::PolicyType::Never)
@@ -668,6 +686,7 @@ fn handle_row_action(
     alert_parent: &ApplicationWindow,
     request_tx: &Sender<CoreRequest>,
     pending_buttons: &Rc<RefCell<Vec<Button>>>,
+    pending_ids: &Rc<RefCell<HashSet<String>>>,
 ) {
     if pkg.status == PackageStatus::Installed {
         // Removing is destructive: ask first.
@@ -684,33 +703,40 @@ fn handle_row_action(
         dialog.set_close_response("cancel");
         let tx = request_tx.clone();
         let pending = pending_buttons.clone();
+        let pending_ids = pending_ids.clone();
         let id = pkg.id.clone();
         let source = pkg.source;
         let btn = button.clone();
         dialog.connect_response(None, move |_, response| {
             if response == "remove" {
-                btn.set_sensitive(false);
-                pending.borrow_mut().push(btn.clone());
                 if tx
                     .try_send(CoreRequest::Remove(id.clone(), Some(source)))
                     .is_err()
                 {
                     eprintln!("brim-gui: request channel full or closed; dropping remove");
+                    // Not queued: leave the button usable.
+                    return;
                 }
+                btn.set_sensitive(false);
+                pending.borrow_mut().push(btn.clone());
+                pending_ids.borrow_mut().insert(id.clone());
             }
         });
         dialog.present(Some(alert_parent));
     } else {
-        // Install or Update: lock the button immediately so a double
-        // click cannot queue a duplicate transaction.
-        button.set_sensitive(false);
-        pending_buttons.borrow_mut().push(button.clone());
+        // Install or Update: lock the button once the transaction is queued
+        // so a double click cannot queue a duplicate. Locking before the
+        // send would leave the button dead when the send fails.
         if request_tx
             .try_send(CoreRequest::Install(pkg.id.clone(), Some(pkg.source)))
             .is_err()
         {
             eprintln!("brim-gui: request channel full or closed; dropping install");
+            return;
         }
+        button.set_sensitive(false);
+        pending_buttons.borrow_mut().push(button.clone());
+        pending_ids.borrow_mut().insert(pkg.id.clone());
     }
 }
 
@@ -922,8 +948,12 @@ fn repos_page(stack: &ViewStack, request_tx: &Sender<CoreRequest>) -> RepoGroups
             if name.is_empty() || url.is_empty() {
                 return;
             }
+            if tx.try_send(CoreRequest::AddFlatpakRemote(name, url)).is_err() {
+                eprintln!("brim-gui: request channel full or closed; dropping remote add");
+                // Not queued: leave the button usable.
+                return;
+            }
             button.set_sensitive(false);
-            let _ = tx.try_send(CoreRequest::AddFlatpakRemote(name, url));
         });
     }
     url_entry.add_suffix(&add_button);
@@ -947,8 +977,12 @@ fn repos_page(stack: &ViewStack, request_tx: &Sender<CoreRequest>) -> RepoGroups
             if !id.contains('/') {
                 return;
             }
+            if tx.try_send(CoreRequest::SetCoprEnabled(id, true)).is_err() {
+                eprintln!("brim-gui: request channel full or closed; dropping copr enable");
+                // Not queued: leave the button usable.
+                return;
+            }
             button.set_sensitive(false);
-            let _ = tx.try_send(CoreRequest::SetCoprEnabled(id, true));
         });
     }
     copr_entry.add_suffix(&enable_button);

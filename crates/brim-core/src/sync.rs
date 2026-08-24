@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{BrimError, Result};
 use crate::models::{Package, SourceType};
 
 /// Current sync file format version.
@@ -44,19 +45,23 @@ pub fn export_sync(packages: &[Package]) -> String {
     serde_json::to_string_pretty(&file).expect("sync serialization cannot fail")
 }
 
-/// Parse a sync file (pure, total): malformed JSON, newer versions and
-/// empty ids yield nothing usable and are skipped.
-pub fn parse_import(text: &str) -> Vec<SyncEntry> {
-    let Ok(file) = serde_json::from_str::<SyncFile>(text) else {
-        return Vec::new();
-    };
+/// Parse a sync file. Malformed JSON and newer format versions are
+/// errors so frontends can warn the user instead of silently importing
+/// nothing; individual entries with empty ids are skipped.
+pub fn parse_import(text: &str) -> Result<Vec<SyncEntry>> {
+    let file = serde_json::from_str::<SyncFile>(text)
+        .map_err(|e| BrimError::Parse(format!("invalid sync file: {e}")))?;
     if file.version > SYNC_VERSION {
-        return Vec::new();
+        return Err(BrimError::Parse(format!(
+            "sync file version {} is newer than supported version {SYNC_VERSION}",
+            file.version
+        )));
     }
-    file.entries
+    Ok(file
+        .entries
         .into_iter()
         .filter(|e| !e.id.trim().is_empty())
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -71,7 +76,7 @@ mod tests {
             Package::new("org.videolan.VLC", "VLC", SourceType::Flatpak),
         ];
         let text = export_sync(&packages);
-        let entries = parse_import(&text);
+        let entries = parse_import(&text).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "htop.x86_64");
         assert_eq!(entries[0].source, SourceType::FedoraOfficial);
@@ -80,13 +85,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_import_is_total_on_garbage() {
-        assert!(parse_import("").is_empty());
-        assert!(parse_import("{not json").is_empty());
-        assert!(parse_import(r#"{"version": 99, "entries": []}"#).is_empty());
-        assert!(parse_import(
-            r#"{"version": 1, "entries": [{"id": "  ", "source": "FedoraOfficial"}]}"#
+    fn parse_import_rejects_malformed_and_newer_files() {
+        assert!(parse_import("").is_err());
+        assert!(parse_import("{not json").is_err());
+        assert!(matches!(
+            parse_import(r#"{"version": 99, "entries": []}"#),
+            Err(BrimError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn parse_import_skips_empty_ids() {
+        let entries = parse_import(
+            r#"{"version": 1, "entries": [{"id": "  ", "source": "FedoraOfficial"}]}"#,
         )
-        .is_empty());
+        .unwrap();
+        assert!(entries.is_empty());
     }
 }

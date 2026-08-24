@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use tokio::process::Command;
 
 use crate::backend::Backend;
-use crate::backends::{probe, QUERY_TIMEOUT};
+use crate::backends::{probe, validate_arg, QUERY_TIMEOUT};
 use crate::error::{BrimError, Result};
 use crate::models::{
     Package, RepoInfo, RepoKind, SourceType, TransactionAction, TransactionResult,
@@ -57,15 +57,17 @@ impl CoprBackend {
             .args(args)
             // Force English output so the parsers see stable messages.
             .env("LC_ALL", "C")
+            // A timed-out query must not leave the child running.
+            .kill_on_drop(true)
             .output();
         let output = match timeout {
             Some(limit) => match tokio::time::timeout(limit, future).await {
-                Ok(result) => result?,
+                Ok(result) => result.map_err(|e| super::spawn_error(program, e))?,
                 Err(_) => {
                     return Err(BrimError::CommandFailed(format!("{program} timed out")));
                 }
             },
-            None => future.await?,
+            None => future.await.map_err(|e| super::spawn_error(program, e))?,
         };
 
         if output.status.success() {
@@ -122,6 +124,7 @@ impl Backend for CoprBackend {
     }
 
     async fn search(&self, query: &str) -> Result<Vec<Package>> {
+        validate_arg(query)?;
         let out =
             crate::http::get_text_query(&self.http, COPR_API_SEARCH, &[("query", query)]).await?;
         Ok(parse_search(&out))
@@ -134,6 +137,7 @@ impl Backend for CoprBackend {
     }
 
     async fn info(&self, id: &str) -> Result<Package> {
+        validate_arg(id)?;
         // Reuse the search endpoint: query the project name and keep the
         // exact `owner/project` match.
         let Some((_, project)) = id.split_once('/') else {
@@ -162,6 +166,7 @@ impl Backend for CoprBackend {
     ///    workflow and is what `remove` mirrors by disabling again).
     async fn install(&self, pkg: &Package) -> Result<TransactionResult> {
         self.ensure_copr_plugin().await?;
+        validate_arg(&pkg.id)?;
         // Enable the repository first, then install the package. The repo
         // enable succeeding while the package step fails is reported as a
         // failed transaction (the message discloses that the repo was
@@ -170,6 +175,7 @@ impl Backend for CoprBackend {
             .run("dnf", &["copr", "enable", "-y", &pkg.id], None)
             .await?;
         let project = pkg.copr_project.as_deref().unwrap_or(&pkg.name);
+        validate_arg(project)?;
         let install_err = match self.run("dnf5", &["install", "-y", project], None).await {
             Ok(install_out) => {
                 out.push_str(&install_out);
@@ -189,12 +195,14 @@ impl Backend for CoprBackend {
 
     async fn remove(&self, pkg: &Package) -> Result<TransactionResult> {
         self.ensure_copr_plugin().await?;
+        validate_arg(&pkg.id)?;
         // Even when the package name does not match the project name (so
         // `dnf5 remove` fails), the repo must still be disabled — otherwise
         // it stays enabled with no recovery path through this backend. A
         // failed package step makes the transaction unsuccessful (the
         // message discloses that the repo was disabled).
         let name = pkg.copr_project.as_deref().unwrap_or(&pkg.name);
+        validate_arg(name)?;
         let remove_result = self.run("dnf5", &["remove", "-y", name], None).await;
         let remove_err = remove_result.as_ref().err().map(|e| e.to_string());
         let mut out = remove_result.unwrap_or_default();
@@ -242,6 +250,7 @@ impl Backend for CoprBackend {
     }
 
     async fn set_repo_enabled(&self, id: &str, enabled: bool) -> Result<TransactionResult> {
+        validate_arg(id)?;
         let action = if enabled { "enable" } else { "disable" };
         let out = self.run("dnf", &["copr", action, "-y", id], None).await?;
         Ok(TransactionResult::ok(

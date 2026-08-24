@@ -22,13 +22,25 @@ pub enum IconChoice {
     Theme(String),
 }
 
-/// Brim's icon cache directory (`~/.cache/brim/icons`).
-pub fn cache_dir() -> PathBuf {
+/// Brim's icon cache directory (`~/.cache/brim/icons`), or `None` when no
+/// per-user cache directory can be determined. Unlike a `/tmp` fallback,
+/// `None` cannot be squatted by another local user.
+pub fn cache_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("brim").join("icons")
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(base.join("brim").join("icons"))
+}
+
+/// Flatpak app ids are reverse-DNS (`org.example.App`): ASCII letters,
+/// digits, dots, underscores and dashes. The id comes from untrusted remote
+/// metadata, so anything else (notably `/` or `..`) must never reach a file
+/// path or URL.
+fn is_safe_app_id(app_id: &str) -> bool {
+    !app_id.is_empty()
+        && app_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Flathub's AppStream CDN icon URL for an application id.
@@ -38,12 +50,22 @@ pub fn flathub_icon_url(app_id: &str) -> String {
 
 /// The cache file an icon for `app_id` would live at, if downloaded.
 pub fn cached_icon(app_id: &str) -> Option<PathBuf> {
-    let path = cache_dir().join(format!("{app_id}.png"));
+    if !is_safe_app_id(app_id) {
+        return None;
+    }
+    let path = cache_dir()?.join(format!("{app_id}.png"));
     path.is_file().then_some(path)
 }
 
 /// Icon shipped by an installed flatpak, without any network access.
 pub fn installed_flatpak_icon(app_id: &str) -> Option<PathBuf> {
+    if !is_safe_app_id(app_id) {
+        return None;
+    }
+    // No per-user cache directory means HOME is unset; the user-level
+    // exports path below would then be relative to the CWD — skip disk
+    // lookup entirely.
+    cache_dir()?;
     let rel = format!("icons/hicolor/128x128/apps/{app_id}.png");
     let candidates = [
         PathBuf::from("/var/lib/flatpak/exports/share").join(&rel),
@@ -132,10 +154,15 @@ pub fn fetch_candidate(pkg: &Package) -> Option<String> {
 /// Download a Flathub icon into the cache. Returns the cached path on
 /// success; the themed fallback stays in place on failure.
 pub async fn fetch_flathub_icon(client: &reqwest::Client, app_id: &str) -> Option<PathBuf> {
+    if !is_safe_app_id(app_id) {
+        return None;
+    }
     if let Some(path) = cached_icon(app_id) {
         return Some(path);
     }
-    let dir = cache_dir();
+    // No per-user cache directory: skip the fetch — the bytes would have
+    // no persistent home, and the row keeps its themed fallback.
+    let dir = cache_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let bytes = brim_core::http::get_bytes(client, &flathub_icon_url(app_id))
         .await
@@ -151,6 +178,16 @@ pub async fn fetch_flathub_icon(client: &reqwest::Client, app_id: &str) -> Optio
 mod tests {
     use super::*;
     use brim_core::SourceType;
+
+    #[test]
+    fn unsafe_app_ids_are_rejected() {
+        assert!(is_safe_app_id("org.kde.kcalc"));
+        assert!(is_safe_app_id("org.example.App_2-x"));
+        assert!(!is_safe_app_id(""));
+        assert!(!is_safe_app_id("../evil"));
+        assert!(!is_safe_app_id("org/example"));
+        assert!(!is_safe_app_id("app/org.example.App/x86_64/stable"));
+    }
 
     #[test]
     fn flathub_url_follows_cdn_layout() {
