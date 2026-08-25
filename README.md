@@ -9,9 +9,10 @@
 [![Rust: stable](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform: Fedora](https://img.shields.io/badge/platform-Fedora%2044-51A2DA.svg)](https://fedoraproject.org/)
 
-DNF5 packages, COPR projects and Flathub apps — one engine, three frontends.
+DNF5 packages, COPR projects and Flathub apps — one engine, three frontends,
+one binary.
 
-`v0.1.6` · Rust edition 2021 · GPL-2.0-only
+`v0.2.0` · Rust edition 2021 · GPL-2.0-only
 
 </div>
 
@@ -68,8 +69,9 @@ glassmorphic web dashboard with a REST API.
 - **Updates at a glance** — `dnf5 check-update` and
   `flatpak remote-ls --updates` merged into one pending-updates view, plus
   per-source dashboard statistics.
-- **Three frontends, one engine** — everything shares `brim-core`; missing
-  tools degrade gracefully instead of failing.
+- **Three frontends, one engine** — a single `brim` binary hosts the CLI,
+  the GUI (`brim gui`) and the web UI (`brim web`) over one shared core
+  engine; missing tools degrade gracefully instead of failing.
 - **Shared configuration** — one `~/.config/brim/config.json` for the CLI, the
   GUI and future services; edit it from the Settings page or with
   `brim config set`.
@@ -91,11 +93,13 @@ glassmorphic web dashboard with a REST API.
 ```bash
 git clone https://github.com/b4lol/brim
 cd brim
-cargo build --release
+cargo install --path . --locked
 ```
 
-Binaries land in `target/release/`: `brim` (CLI), `brim-gui` (desktop app),
-`brim-web` (web server).
+This installs a single `brim` binary: the terminal CLI by default, the
+desktop app via `brim gui`, and the web server via `brim web`. (Without
+installing, `cargo build --release` puts the same binary in
+`target/release/brim`.)
 
 ## CLI Usage
 
@@ -111,6 +115,8 @@ The terminal companion (binary name: `brim`):
 | `brim stats` | Per-source dashboard statistics |
 | `brim info <id> [--source <name>]` | Package details |
 | `brim config list\|get\|set\|reset` | View and edit configuration |
+| `brim gui` | Launch the graphical app store |
+| `brim web [--port 8080]` | Run the web UI and REST API |
 
 `<name>` is `fedora`, `copr`, or `flatpak`. The confirmation prompt names the
 resolved source before any transaction runs (e.g.
@@ -134,7 +140,7 @@ handled properly).
 ## Desktop App
 
 ```bash
-cargo run --release -p brim-gui
+brim gui
 ```
 
 A native GNOME-style store with six pages — **Trending**, **Updates**,
@@ -154,7 +160,7 @@ confirmation first; closing the window shuts the worker down cleanly.
 ## Web Dashboard
 
 ```bash
-cargo run --release -p brim-web -- --port 8080   # 8080 is the default
+brim web --port 8080   # 8080 is the default
 # then open http://127.0.0.1:8080
 ```
 
@@ -179,9 +185,9 @@ REST API:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-cargo build --workspace --release
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
+cargo build --release
 ```
 
 The same four commands run in CI on every push and pull request (see

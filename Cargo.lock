@@ -123,59 +123,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
-name = "brim-cli"
-version = "0.1.7"
+name = "brim"
+version = "0.2.0"
 dependencies = [
- "brim-core",
+ "async-channel",
+ "async-trait",
+ "bytes",
  "clap",
  "colored",
- "indicatif",
- "libc",
- "serde",
- "serde_json",
- "tokio",
- "unicode-width",
-]
-
-[[package]]
-name = "brim-core"
-version = "0.1.7"
-dependencies = [
- "async-trait",
  "futures",
+ "gtk4",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "indicatif",
+ "libadwaita",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "brim-gui"
-version = "0.1.7"
-dependencies = [
- "async-channel",
- "brim-core",
- "futures",
- "gtk4",
- "libadwaita",
- "reqwest",
- "tokio",
-]
-
-[[package]]
-name = "brim-web"
-version = "0.1.7"
-dependencies = [
- "brim-core",
- "bytes",
- "clap",
- "http-body-util",
- "hyper",
- "hyper-util",
- "serde",
- "serde_json",
- "tokio",
+ "unicode-width",
 ]
 
 [[package]]
