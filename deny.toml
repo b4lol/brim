@@ -23,5 +23,13 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "GPL-2.0",
+    "GPL-2.0-only",
     "GPL-3.0",
 ]
+
+# webpki-root-certs (via reqwest → rustls-platform-verifier) carries the
+# permissive CDLA-Permissive-2.0 data license for the Mozilla root store;
+# allow it for that crate only instead of globally.
+[[licenses.exceptions]]
+allow = ["CDLA-Permissive-2.0"]
+crate = "webpki-root-certs"
