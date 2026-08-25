@@ -67,3 +67,18 @@ jobs:
 
       - name: Dependency license check
         run: cargo deny check licenses
+
+  dependency-review:
+    name: dependency review (PR)
+    runs-on: ubuntu-24.04
+    # Only PRs change the dependency set relative to a base ref; pushes to
+    # main are already covered by the RUSTSEC + license audit job.
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate

@@ -1,0 +1,31 @@
+# Dependabot: keep Cargo dependencies and GitHub Actions current.
+#
+# Minor/patch Cargo updates arrive grouped in a single weekly PR (one PR
+# instead of dozens); majors get their own PRs since they need review.
+# CI gates every bump: fmt/clippy/test/build plus RUSTSEC + cargo deny.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    groups:
+      minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
