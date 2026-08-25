@@ -44,8 +44,9 @@ impl State {
 
 /// JSON body accepted by `POST /api/install` and `POST /api/remove`.
 ///
-/// `source` uses the API's lowercase names (`fedora`, `copr`, `flatpak`)
-/// rather than brim-core's serde variant names; `null`/missing means "any".
+/// `source` uses the API's lowercase names (`fedora`, `copr`, `flatpak`,
+/// `debian`) rather than brim-core's serde variant names; `null`/missing
+/// means "any".
 #[derive(serde::Deserialize)]
 struct PackageRequest {
     id: String,
@@ -317,6 +318,7 @@ fn parse_source(raw: Option<&str>) -> Result<Option<SourceType>, String> {
         Some("fedora") => Ok(Some(SourceType::FedoraOfficial)),
         Some("copr") => Ok(Some(SourceType::Copr)),
         Some("flatpak") => Ok(Some(SourceType::Flatpak)),
+        Some("debian") => Ok(Some(SourceType::Debian)),
         Some(other) => Err(format!("unknown source: {other}")),
     }
 }
@@ -524,6 +526,10 @@ mod tests {
         assert_eq!(
             parse_source(Some("flatpak")).unwrap(),
             Some(SourceType::Flatpak)
+        );
+        assert_eq!(
+            parse_source(Some("debian")).unwrap(),
+            Some(SourceType::Debian)
         );
         assert!(parse_source(Some("FedoraOfficial")).is_err());
         assert!(parse_source(Some("bogus")).is_err());

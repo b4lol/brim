@@ -45,6 +45,52 @@ pub fn print_packages(pkgs: &[Package]) {
     }
 }
 
+/// Print one streaming-search batch as numbered rows. `start` is the
+/// 1-based number of the first row, so numbering runs continuously across
+/// batches; the column header is printed only for the first batch
+/// (`header`). Returns the number of rows printed.
+pub fn print_search_batch(pkgs: &[Package], start: usize, header: bool) -> usize {
+    if pkgs.is_empty() {
+        return 0;
+    }
+
+    let sources: Vec<String> = pkgs.iter().map(|p| p.source.to_string()).collect();
+    let statuses: Vec<String> = pkgs.iter().map(|p| p.status.to_string()).collect();
+
+    let last = start + pkgs.len() - 1;
+    let num_w = last.to_string().len().max(1);
+    let name_w = width(pkgs.iter().map(|p| p.name.as_str()), "NAME");
+    let version_w = width(pkgs.iter().map(|p| p.version.as_str()), "VERSION");
+    let source_w = width(sources.iter(), "SOURCE");
+    let status_w = width(statuses.iter(), "STATUS");
+
+    if header {
+        println!(
+            "{}  {}  {}  {}  {}  {}",
+            pad("#", num_w).bold(),
+            pad("NAME", name_w).bold(),
+            pad("VERSION", version_w).bold(),
+            pad("SOURCE", source_w).bold(),
+            pad("STATUS", status_w).bold(),
+            "SUMMARY".bold(),
+        );
+    }
+    for (index, (pkg, (source, status))) in
+        pkgs.iter().zip(sources.iter().zip(&statuses)).enumerate()
+    {
+        println!(
+            "{}  {}  {}  {}  {}  {}",
+            format!("{:>num_w$}", start + index).dimmed(),
+            pad(&sanitize(&pkg.name), name_w),
+            pad(&sanitize(&pkg.version), version_w),
+            color_source(pkg.source, &pad(source, source_w)),
+            pad(status, status_w),
+            truncate(&sanitize(&pkg.summary), SUMMARY_MAX).dimmed(),
+        );
+    }
+    pkgs.len()
+}
+
 /// Print aggregated system statistics.
 pub fn print_stats(stats: &SystemStats) {
     println!("{}", "System statistics".bold());
@@ -66,6 +112,60 @@ pub fn print_stats(stats: &SystemStats) {
             stat.installed,
             stat.updates,
         );
+    }
+}
+
+/// Print pending updates grouped by source, showing the installed and the
+/// new version side by side. Groups appear in a stable source order.
+pub fn print_updates(pkgs: &[Package]) {
+    if pkgs.is_empty() {
+        println!("{}", "Everything is up to date.".green().bold());
+        return;
+    }
+    let mut first = true;
+    for source in [
+        SourceType::FedoraOfficial,
+        SourceType::Debian,
+        SourceType::Copr,
+        SourceType::Flatpak,
+    ] {
+        let group: Vec<&Package> = pkgs.iter().filter(|p| p.source == source).collect();
+        if group.is_empty() {
+            continue;
+        }
+        if !first {
+            println!();
+        }
+        first = false;
+        let header = format!(
+            "{} — {} update{}",
+            source,
+            group.len(),
+            if group.len() == 1 { "" } else { "s" }
+        );
+        println!("{}", color_source(source, &header).bold());
+
+        let installed: Vec<String> = group
+            .iter()
+            .map(|p| p.installed_version.clone().unwrap_or_else(|| "—".into()))
+            .collect();
+        let name_w = width(group.iter().map(|p| p.name.as_str()), "NAME");
+        let installed_w = width(installed.iter(), "INSTALLED");
+        let version_w = width(group.iter().map(|p| p.version.as_str()), "NEW VERSION");
+        println!(
+            "  {}  {}  {}",
+            pad("NAME", name_w).bold(),
+            pad("INSTALLED", installed_w).bold(),
+            pad("NEW VERSION", version_w).bold(),
+        );
+        for (pkg, old) in group.iter().zip(&installed) {
+            println!(
+                "  {}  {}  {}",
+                pad(&sanitize(&pkg.name), name_w),
+                pad(&sanitize(old), installed_w).dimmed(),
+                sanitize(&pkg.version).green(),
+            );
+        }
     }
 }
 
@@ -92,11 +192,12 @@ fn pad(text: &str, width: usize) -> String {
 }
 
 /// Apply the per-source color to an already padded source cell.
-fn color_source(source: SourceType, cell: &str) -> colored::ColoredString {
+pub(crate) fn color_source(source: SourceType, cell: &str) -> colored::ColoredString {
     match source {
         SourceType::FedoraOfficial => cell.blue(),
         SourceType::Copr => cell.magenta(),
         SourceType::Flatpak => cell.yellow(),
+        SourceType::Debian => cell.red(),
     }
 }
 

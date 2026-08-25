@@ -771,6 +771,7 @@ fn settings_page(
         ("Fedora (DNF5)", "Official Fedora RPMs", "sources.dnf5"),
         ("COPR", "Community projects", "sources.copr"),
         ("Flatpak", "Flathub applications", "sources.flatpak"),
+        ("Debian (APT)", "Debian/Ubuntu packages", "sources.apt"),
     ] {
         let row = adw::SwitchRow::builder()
             .title(title)

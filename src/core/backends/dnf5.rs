@@ -141,6 +141,7 @@ impl Backend for Dnf5Backend {
 
     async fn install(&self, pkg: &Package) -> Result<TransactionResult> {
         validate_arg(&pkg.id)?;
+        super::require_root("dnf5")?;
         // Real transaction: no timeout (dnf5 upgrades installed packages).
         let out = self.run(&["install", "-y", &pkg.id], false, None).await?;
         Ok(TransactionResult::ok(
@@ -153,6 +154,7 @@ impl Backend for Dnf5Backend {
 
     async fn remove(&self, pkg: &Package) -> Result<TransactionResult> {
         validate_arg(&pkg.id)?;
+        super::require_root("dnf5")?;
         let out = self.run(&["remove", "-y", &pkg.id], false, None).await?;
         Ok(TransactionResult::ok(
             TransactionAction::Remove,
@@ -168,6 +170,7 @@ impl Backend for Dnf5Backend {
     }
 
     async fn upgrade(&self) -> Result<TransactionResult> {
+        super::require_root("dnf5")?;
         let out = self.run(&["upgrade", "-y"], false, None).await?;
         Ok(TransactionResult::ok(
             TransactionAction::Upgrade,

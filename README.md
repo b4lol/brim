@@ -4,15 +4,15 @@
 
 # Brim
 
-**A modern, pure-Rust package manager and app store for Fedora Linux.**
+**A modern, pure-Rust package manager and app store for Fedora and Debian.**
 
 [![CI](https://github.com/b4lol/brim/actions/workflows/ci.yml/badge.svg)](https://github.com/b4lol/brim/actions/workflows/ci.yml)
 [![License: GPL v2](https://img.shields.io/badge/license-GPLv2-blue.svg)](LICENSE)
 [![Rust: stable](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org/)
 [![Platform: Fedora](https://img.shields.io/badge/platform-Fedora%2044-51A2DA.svg)](https://fedoraproject.org/)
 
-DNF5 packages, COPR projects and Flathub apps — one engine, three frontends,
-one binary.
+DNF5 packages, APT packages, COPR projects and Flathub apps — one engine,
+three frontends, one binary.
 
 `v0.2.0` · Rust edition 2021 · GPL-2.0-only
 
@@ -20,10 +20,12 @@ one binary.
 
 ---
 
-**Brim** unifies **DNF5** (official RPMs), **COPR** (community projects), and
-**Flatpak** (Flathub) behind a single async engine, and exposes it through
-three frontends: a terminal CLI, a native GTK4/Libadwaita desktop app, and a
-glassmorphic web dashboard with a REST API.
+**Brim** unifies **DNF5** (official Fedora RPMs), **APT** (Debian/Ubuntu
+packages), **COPR** (community projects), and **Flatpak** (Flathub) behind a
+single async engine, and exposes it through three frontends: a terminal CLI,
+a native GTK4/Libadwaita desktop app, and a glassmorphic web dashboard with a
+REST API. On any given machine only the available backends activate — on
+Fedora that is DNF5 + Flatpak (+ COPR), on Debian/Ubuntu APT + Flatpak.
 
 ## Screenshots
 
@@ -81,13 +83,15 @@ glassmorphic web dashboard with a REST API.
 ## Requirements
 
 - Fedora Linux (developed and verified on Fedora 44) with `dnf5`, `dnf` (COPR
-  plugin), and `flatpak` available
+  plugin), and `flatpak` available — or Debian/Ubuntu with `apt` and
+  `flatpak`. Missing tools are skipped, never fatal.
 - Rust stable toolchain via [rustup](https://rustup.rs/) (with the `rustfmt`
   and `clippy` components for development)
 - For the GUI: system GTK4 and Libadwaita development packages:
 
   ```bash
-  sudo dnf5 install gtk4-devel libadwaita-devel
+  sudo dnf5 install gtk4-devel libadwaita-devel    # Fedora
+  sudo apt install libgtk-4-dev libadwaita-1-dev   # Debian/Ubuntu
   ```
 
 ## Quickstart
@@ -103,6 +107,15 @@ desktop app via `brim gui`, and the web server via `brim web`. (Without
 installing, `cargo build --release` puts the same binary in
 `target/release/brim`.)
 
+System-package transactions run with `sudo`, and root's `secure_path` does
+not cover `~/.cargo/bin` — so also install system-wide:
+
+```bash
+sudo install -m 0755 ~/.cargo/bin/brim /usr/local/bin/brim
+```
+
+Re-run that after every upgrade so the root copy never goes stale.
+
 ## CLI Usage
 
 The terminal companion (binary name: `brim`):
@@ -110,19 +123,34 @@ The terminal companion (binary name: `brim`):
 | Command | Description |
 | ------- | ----------- |
 | `brim search <query> [--source <name>]` | Search all sources, or just one |
-| `brim install <id> [--source <name>] [--yes]` | Install (confirms unless `--yes`) |
+| `brim install <id\|#> [--source <name>] [--yes]` | Install by id or result number (confirms unless `--yes`) |
 | `brim remove <id> [--source <name>] [--yes]` | Remove (confirms unless `--yes`) |
 | `brim upgrade [--yes]` | Upgrade everything across all sources |
-| `brim list` | List installed packages |
+| `brim list` | List installed packages (with per-source counts) |
+| `brim updates` | Pending updates in detail: installed → new version, grouped by source |
 | `brim stats` | Per-source dashboard statistics |
 | `brim info <id> [--source <name>]` | Package details |
 | `brim config list\|get\|set\|reset` | View and edit configuration |
+| `brim completions <bash\|zsh>` | Print a shell completion script |
 | `brim gui` | Launch the graphical app store |
 | `brim web [--port 8080]` | Run the web UI and REST API |
 
-`<name>` is `fedora`, `copr`, or `flatpak`. The confirmation prompt names the
+`<name>` is `fedora`, `debian`, `copr`, or `flatpak`. The confirmation prompt names the
 resolved source before any transaction runs (e.g.
-`Confirm install 'htop' from Fedora? [y/N]`).
+`Confirm install 'htop' from Fedora? [y/N]`). System-package transactions
+(dnf5 and the COPR plugin) require root — as a regular user Brim fails fast
+with an actionable message (`dnf5 transactions require root — re-run with
+sudo …`) instead of surfacing the tool's raw refusal; flatpak transactions
+work unprivileged.
+
+Search results stream in numbered rows as each source answers, and the
+displayed order is cached (`~/.cache/brim/last-search.json`), so a number
+installs exactly the row you saw:
+
+```bash
+brim search ghostty     # 1  ghostty  …  2  …
+brim install 1          # installs row 1 from the last search
+```
 
 Examples:
 
@@ -138,6 +166,18 @@ brim upgrade                    # upgrades dnf5 packages and flatpaks
 Output is colorized and tabular; transactions show spinners and exit non-zero
 on failure. Pipelines behave (`brim list | head` exits quietly — SIGPIPE is
 handled properly).
+
+Shell completions for bash and zsh are generated from the CLI definition:
+
+```bash
+# bash (auto-loaded by bash-completion)
+brim completions bash > ~/.local/share/bash-completion/completions/brim
+
+# zsh — add the directory to fpath in ~/.zshrc first:
+#   fpath=(~/.local/share/zsh/site-functions $fpath)
+#   autoload -Uz compinit && compinit
+brim completions zsh > ~/.local/share/zsh/site-functions/_brim
+```
 
 ## Desktop App
 

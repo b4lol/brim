@@ -1,5 +1,6 @@
 //! Concrete package management backends.
 
+pub mod apt;
 pub(crate) mod cache;
 pub mod copr;
 pub mod dnf5;
@@ -59,6 +60,26 @@ pub(crate) fn spawn_error(program: &str, e: std::io::Error) -> BrimError {
     BrimError::CommandFailed(format!("failed to execute {program}: {e}"))
 }
 
+/// System package tools (dnf5, the `dnf copr` plugin) modify the system
+/// and refuse to run as a regular user. Fail fast with an actionable
+/// message instead of surfacing the tool's raw refusal text after the
+/// fact.
+pub(crate) fn require_root(tool: &str) -> Result<()> {
+    // SAFETY: geteuid() cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        Ok(())
+    } else {
+        Err(BrimError::PrivilegeRequired(privilege_message(tool)))
+    }
+}
+
+/// The actionable message for a non-root transaction attempt (pure, so
+/// the wording is unit-testable).
+fn privilege_message(tool: &str) -> String {
+    format!("{tool} transactions require root — re-run with sudo (e.g. 'sudo brim upgrade')")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +97,16 @@ mod tests {
         assert!(validate_arg("org.mozilla.firefox").is_ok());
         assert!(validate_arg("owner/project").is_ok());
         assert!(validate_arg("").is_ok());
+    }
+
+    #[test]
+    fn privilege_message_is_actionable() {
+        let message = privilege_message("dnf5");
+        assert!(message.contains("dnf5"));
+        assert!(message.contains("sudo"), "message must guide: {message}");
+        // The dedicated variant displays the message verbatim (no
+        // "command failed:" prefix — nothing was executed).
+        let err = BrimError::PrivilegeRequired(message.clone());
+        assert_eq!(err.to_string(), message);
     }
 }

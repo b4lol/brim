@@ -22,7 +22,8 @@ const CSS: &str = r#"
 
 .badge-fedora,
 .badge-copr,
-.badge-flatpak {
+.badge-flatpak,
+.badge-debian {
     border-radius: 8px;
     padding: 2px 8px;
     font-size: 0.75rem;
@@ -39,6 +40,10 @@ const CSS: &str = r#"
 
 .badge-flatpak {
     background-color: alpha(@green_2, 0.35);
+}
+
+.badge-debian {
+    background-color: alpha(@red_2, 0.35);
 }
 "#;
 

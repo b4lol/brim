@@ -208,7 +208,12 @@ fn bind_row(widgets: &RowWidgets, pkg: &Package, pending_ids: &HashSet<String>) 
     widgets.subtitle.set_text(&row_subtitle(pkg));
 
     widgets.badge.set_text(&pkg.source.to_string());
-    for class in ["badge-fedora", "badge-copr", "badge-flatpak"] {
+    for class in [
+        "badge-fedora",
+        "badge-copr",
+        "badge-flatpak",
+        "badge-debian",
+    ] {
         widgets.badge.remove_css_class(class);
     }
     widgets.badge.add_css_class(pkg.source.badge_class());

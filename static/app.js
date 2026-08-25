@@ -14,6 +14,7 @@
         FedoraOfficial: { api: "fedora", label: "Fedora", badge: "badge-fedora" },
         Copr: { api: "copr", label: "COPR", badge: "badge-copr" },
         Flatpak: { api: "flatpak", label: "Flatpak", badge: "badge-flatpak" },
+        Debian: { api: "debian", label: "Debian", badge: "badge-debian" },
     };
 
     // Per-session API token, delivered in the URL fragment by the server

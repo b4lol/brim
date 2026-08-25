@@ -20,6 +20,10 @@ pub enum BrimError {
     /// User-supplied input was rejected before reaching a backend.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// A transaction needs root privileges; the message tells the user
+    /// exactly how to re-run (e.g. with `sudo`).
+    #[error("{0}")]
+    PrivilegeRequired(String),
     /// An HTTP request failed (network error or non-2xx status).
     #[error("http error: {0}")]
     Http(String),

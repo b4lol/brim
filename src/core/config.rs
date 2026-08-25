@@ -31,6 +31,7 @@ pub struct SourceConfig {
     pub dnf5: bool,
     pub copr: bool,
     pub flatpak: bool,
+    pub apt: bool,
 }
 
 impl Default for SourceConfig {
@@ -41,6 +42,7 @@ impl Default for SourceConfig {
             // is opt-in: the GUI asks with a risk warning before enabling it.
             copr: false,
             flatpak: true,
+            apt: true,
         }
     }
 }
@@ -66,6 +68,7 @@ impl Config {
         "sources.dnf5",
         "sources.copr",
         "sources.flatpak",
+        "sources.apt",
         "gui.icon_downloads",
     ];
 
@@ -75,6 +78,7 @@ impl Config {
             "sources.dnf5" => Some(self.sources.dnf5),
             "sources.copr" => Some(self.sources.copr),
             "sources.flatpak" => Some(self.sources.flatpak),
+            "sources.apt" => Some(self.sources.apt),
             "gui.icon_downloads" => Some(self.gui.icon_downloads),
             _ => None,
         }
@@ -86,6 +90,7 @@ impl Config {
             "sources.dnf5" => self.sources.dnf5 = value,
             "sources.copr" => self.sources.copr = value,
             "sources.flatpak" => self.sources.flatpak = value,
+            "sources.apt" => self.sources.apt = value,
             "gui.icon_downloads" => self.gui.icon_downloads = value,
             _ => return false,
         }

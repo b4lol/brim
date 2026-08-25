@@ -9,7 +9,9 @@ use futures::future::join_all;
 use tokio::sync::Mutex;
 
 use crate::core::backend::Backend;
-use crate::core::backends::{copr::CoprBackend, dnf5::Dnf5Backend, flatpak::FlatpakBackend};
+use crate::core::backends::{
+    apt::AptBackend, copr::CoprBackend, dnf5::Dnf5Backend, flatpak::FlatpakBackend,
+};
 use crate::core::error::BrimError;
 use crate::core::models::{
     Package, PackageStatus, RepoInfo, SourceStat, SourceType, SystemStats, TransactionAction,
@@ -64,6 +66,9 @@ impl PackageManager {
         }
         if config.sources.flatpak {
             backends.push(Box::new(FlatpakBackend::new()));
+        }
+        if config.sources.apt {
+            backends.push(Box::new(AptBackend::new()));
         }
         Self::with_backends(backends)
     }
@@ -1002,17 +1007,20 @@ mod tests {
         assert!(sources.contains(&SourceType::FedoraOfficial));
         assert!(sources.contains(&SourceType::Copr));
         assert!(sources.contains(&SourceType::Flatpak));
-        // COPR is off by default (opt-in): the default config builds two
-        // backends, Fedora and Flatpak.
+        assert!(sources.contains(&SourceType::Debian));
+        // COPR is off by default (opt-in): the default config builds three
+        // backends — Fedora, Flatpak and APT (unavailable ones are skipped
+        // at runtime by their availability probes).
         let default = PackageManager::from_config(&Config::default());
         let default_sources: Vec<SourceType> =
             default.backends.iter().map(|b| b.source()).collect();
-        assert_eq!(default.backends.len(), 2);
+        assert_eq!(default.backends.len(), 3);
         assert!(!default_sources.contains(&SourceType::Copr));
         let none = PackageManager::from_config(&{
             let mut c = Config::default();
             c.sources.dnf5 = false;
             c.sources.flatpak = false;
+            c.sources.apt = false;
             c
         });
         assert!(none.backends.is_empty());

@@ -208,6 +208,7 @@ impl Backend for CoprBackend {
     async fn install(&self, pkg: &Package) -> Result<TransactionResult> {
         self.ensure_copr_plugin().await?;
         validate_arg(&pkg.id)?;
+        super::require_root("dnf copr")?;
         // Enable the repository first, then install the package. The repo
         // enable succeeding while the package step fails is reported as a
         // failed transaction (the message discloses that the repo was
@@ -237,6 +238,7 @@ impl Backend for CoprBackend {
     async fn remove(&self, pkg: &Package) -> Result<TransactionResult> {
         self.ensure_copr_plugin().await?;
         validate_arg(&pkg.id)?;
+        super::require_root("dnf copr")?;
         // Even when the package name does not match the project name (so
         // `dnf5 remove` fails), the repo must still be disabled — otherwise
         // it stays enabled with no recovery path through this backend. A
@@ -292,6 +294,7 @@ impl Backend for CoprBackend {
 
     async fn set_repo_enabled(&self, id: &str, enabled: bool) -> Result<TransactionResult> {
         validate_arg(id)?;
+        super::require_root("dnf copr")?;
         let action = if enabled { "enable" } else { "disable" };
         let out = self.run("dnf", &["copr", action, "-y", id], None).await?;
         Ok(TransactionResult::ok(

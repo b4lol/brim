@@ -9,6 +9,7 @@ pub enum SourceType {
     FedoraOfficial,
     Copr,
     Flatpak,
+    Debian,
 }
 
 impl fmt::Display for SourceType {
@@ -17,6 +18,7 @@ impl fmt::Display for SourceType {
             SourceType::FedoraOfficial => "Fedora",
             SourceType::Copr => "COPR",
             SourceType::Flatpak => "Flatpak",
+            SourceType::Debian => "Debian",
         };
         write!(f, "{}", s)
     }
@@ -29,6 +31,7 @@ impl SourceType {
             SourceType::FedoraOfficial => "badge-fedora",
             SourceType::Copr => "badge-copr",
             SourceType::Flatpak => "badge-flatpak",
+            SourceType::Debian => "badge-debian",
         }
     }
 }

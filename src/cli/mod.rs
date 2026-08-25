@@ -1,6 +1,7 @@
 //! Brim terminal companion — CLI frontend over the brim-core engine.
 
 mod banner;
+mod lastsearch;
 mod prompt;
 mod sanitize;
 mod table;
@@ -14,6 +15,7 @@ use colored::Colorize;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use sanitize::sanitize;
+use std::io::IsTerminal;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -40,7 +42,8 @@ pub enum Commands {
         #[arg(long, value_enum)]
         source: Option<SourceArg>,
     },
-    /// Install a package (asks for confirmation unless --yes).
+    /// Install a package by id or by row number (#) from the last search
+    /// (asks for confirmation unless --yes).
     Install {
         id: String,
         /// Restrict the install to one source.
@@ -68,6 +71,8 @@ pub enum Commands {
     },
     /// List installed packages.
     List,
+    /// List pending updates in detail (installed → new version).
+    Updates,
     /// Show system statistics.
     Stats,
     /// Show details for a package.
@@ -81,6 +86,12 @@ pub enum Commands {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Print a shell completion script to stdout (bash or zsh).
+    Completions {
+        /// The shell to generate completions for.
+        #[arg(value_enum)]
+        shell: ShellArg,
     },
     /// Launch the graphical app store.
     Gui,
@@ -109,6 +120,7 @@ pub enum SourceArg {
     Fedora,
     Copr,
     Flatpak,
+    Debian,
 }
 
 impl From<SourceArg> for SourceType {
@@ -117,6 +129,23 @@ impl From<SourceArg> for SourceType {
             SourceArg::Fedora => SourceType::FedoraOfficial,
             SourceArg::Copr => SourceType::Copr,
             SourceArg::Flatpak => SourceType::Flatpak,
+            SourceArg::Debian => SourceType::Debian,
+        }
+    }
+}
+
+/// Shells Brim ships completions for.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ShellArg {
+    Bash,
+    Zsh,
+}
+
+impl From<ShellArg> for clap_complete::Shell {
+    fn from(arg: ShellArg) -> Self {
+        match arg {
+            ShellArg::Bash => clap_complete::Shell::Bash,
+            ShellArg::Zsh => clap_complete::Shell::Zsh,
         }
     }
 }
@@ -163,12 +192,21 @@ async fn dispatch(cli: &Cli) -> Result<bool> {
     if let Commands::Config { action } = &cli.command {
         return run_config(action);
     }
+    // Completion scripts are pure clap metadata: no backends, no banner
+    // concerns — the generated script goes to stdout verbatim.
+    if let Commands::Completions { shell } = &cli.command {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        let name = command.get_name().to_string();
+        let shell: clap_complete::Shell = (*shell).into();
+        clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
+        return Ok(true);
+    }
     // Async constructor: the sync one would block the tokio executor
     // while reading the config.
     let pm = PackageManager::new_async().await;
     match &cli.command {
         // Handled above, before any backend is constructed.
-        Commands::Config { .. } => unreachable!(),
+        Commands::Config { .. } | Commands::Completions { .. } => unreachable!(),
         // Dispatched by `main` before `run` is ever called.
         Commands::Gui | Commands::Web { .. } => unreachable!(),
         Commands::Search { query, source } => {
@@ -182,19 +220,22 @@ async fn dispatch(cli: &Cli) -> Result<bool> {
             } else {
                 // Stream each backend's batch as soon as it completes, so
                 // a slow source (COPR's endpoint takes ~9 s) no longer
-                // hides the fast results behind a spinner.
+                // hides the fast results behind a spinner. Rows are
+                // numbered continuously and cached, so `brim install <#>`
+                // installs exactly the row the user saw.
                 let mut errors = Vec::new();
-                let mut printed_any = false;
+                let mut all: Vec<Package> = Vec::new();
+                let mut printed = 0usize;
                 let mut stream = pm.search_stream(query, source.map(Into::into)).await;
                 while let Some((src, result)) = stream.next().await {
                     match result {
                         Ok(mut batch) if !batch.is_empty() => {
-                            if !printed_any {
+                            if printed == 0 {
                                 pb.finish_and_clear();
-                                printed_any = true;
                             }
                             crate::core::manager::sort_search_results(query, &mut batch);
-                            table::print_packages(&batch);
+                            printed += table::print_search_batch(&batch, printed + 1, printed == 0);
+                            all.extend(batch);
                         }
                         Ok(_) => {}
                         Err(e) => errors.push((src, e)),
@@ -202,19 +243,38 @@ async fn dispatch(cli: &Cli) -> Result<bool> {
                 }
                 pb.finish_and_clear();
                 warn_backends(&errors);
-                if !printed_any {
+                if printed == 0 {
                     table::print_packages(&[]);
+                } else {
+                    lastsearch::save(&all).await;
+                    // Summary and tip are decoration for humans; keep piped
+                    // output parseable.
+                    if std::io::stdout().is_terminal() {
+                        println!(
+                            "{}",
+                            format!(
+                                "{printed} results{} — install one with: brim install <#>",
+                                source_counts(&all)
+                            )
+                            .dimmed()
+                        );
+                    }
                 }
             }
         }
         Commands::Install { id, yes, source } => {
             let source = source.map(Into::into);
-            let pkg = resolve(&pm, id, source).await?;
-            if !yes && !prompt::confirm("Install", id, Some(&pkg.source.to_string())) {
+            // A pure-number id refers to a row of the last search (see
+            // lastsearch.rs); anything else resolves by package id.
+            let pkg = match result_number(id) {
+                Some(number) => lastsearch::package_at(number).await?,
+                None => resolve(&pm, id, source).await?,
+            };
+            if !yes && !prompt::confirm("Install", &pkg.name, Some(&pkg.source.to_string())) {
                 println!("Aborted.");
                 return Ok(true);
             }
-            let pb = spinner(&format!("Installing '{id}'…"));
+            let pb = spinner(&format!("Installing '{}'…", pkg.name));
             // The resolved package goes straight to the backend: no
             // second resolve, and no room for the resolution to change
             // between the prompt and the transaction (TOCTOU).
@@ -253,6 +313,42 @@ async fn dispatch(cli: &Cli) -> Result<bool> {
                 print_json(&pkgs)?;
             } else {
                 table::print_packages(&pkgs);
+                // The footer is decoration for humans; keep pipes clean.
+                if !pkgs.is_empty() && std::io::stdout().is_terminal() {
+                    println!(
+                        "{}",
+                        format!("{} packages{}", pkgs.len(), source_counts(&pkgs)).dimmed()
+                    );
+                }
+            }
+        }
+        Commands::Updates => {
+            // Updates and the installed list are fetched together: matching
+            // the two fills in each update's installed version, so the table
+            // can show old → new instead of just the new version.
+            let pb = spinner("Checking for updates…");
+            let (mut updates, update_errors) = pm.updates_with_errors().await;
+            let (installed, list_errors) = pm.list_installed_with_errors().await;
+            pb.finish_and_clear();
+            warn_backends(&update_errors);
+            warn_backends(&list_errors);
+            fill_installed_versions(&mut updates, &installed);
+            if cli.json {
+                print_json(&updates)?;
+            } else {
+                table::print_updates(&updates);
+                if !updates.is_empty() && std::io::stdout().is_terminal() {
+                    println!();
+                    println!(
+                        "{}",
+                        format!(
+                            "{} updates pending{} — apply with: brim upgrade",
+                            updates.len(),
+                            source_counts(&updates)
+                        )
+                        .dimmed()
+                    );
+                }
             }
         }
         Commands::Stats => {
@@ -340,6 +436,17 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// Interpret `id` as a 1-based search-result number: pure ASCII digits
+/// only, so real package ids (even numeric-looking ones like `7zip`)
+/// still resolve by name.
+fn result_number(id: &str) -> Option<usize> {
+    if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+        id.parse().ok()
+    } else {
+        None
+    }
+}
+
 /// The error for an unknown config key, listing valid keys.
 fn unknown_key(key: &str) -> BrimError {
     BrimError::Parse(format!(
@@ -370,6 +477,44 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+/// Per-source counts for a result footer: " (Fedora: 2, COPR: 27)" —
+/// empty when there is nothing to break down.
+fn source_counts(pkgs: &[Package]) -> String {
+    let counts: Vec<String> = [
+        SourceType::FedoraOfficial,
+        SourceType::Debian,
+        SourceType::Copr,
+        SourceType::Flatpak,
+    ]
+    .into_iter()
+    .filter_map(|source| {
+        let n = pkgs.iter().filter(|p| p.source == source).count();
+        (n > 0).then(|| format!("{source}: {n}"))
+    })
+    .collect();
+    if counts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", counts.join(", "))
+    }
+}
+
+/// Fill each update's installed version from the installed list (matched
+/// by package id), so the updates table can show old → new.
+fn fill_installed_versions(updates: &mut [Package], installed: &[Package]) {
+    let versions: std::collections::HashMap<&str, &str> = installed
+        .iter()
+        .filter_map(|p| p.installed_version.as_deref().map(|v| (p.id.as_str(), v)))
+        .collect();
+    for pkg in updates {
+        if pkg.installed_version.is_none() {
+            if let Some(version) = versions.get(pkg.id.as_str()) {
+                pkg.installed_version = Some((*version).to_string());
+            }
+        }
+    }
+}
+
 /// Resolve a package before a transaction so the confirmation prompt can
 /// name the source it will come from. Uses `PackageManager::resolve`, whose
 /// search fallback also finds not-yet-installed flatpaks that `info` alone
@@ -395,26 +540,53 @@ fn spinner(message: &str) -> ProgressBar {
 
 /// Print package details for the `info` command. Untrusted fields are
 /// sanitized so remote metadata cannot inject terminal escape sequences.
+/// Only known fields are printed — backends leave unknowns empty.
 fn print_info(pkg: &Package) {
-    println!("{}", sanitize(&pkg.name).bold());
-    println!("  Version:  {}", sanitize(&pkg.version));
-    if let Some(installed) = &pkg.installed_version {
-        println!("  Installed: {}", sanitize(installed));
+    // Header: name with the colored source badge and status.
+    println!(
+        "{}  {}  {}",
+        sanitize(&pkg.name).bold(),
+        table::color_source(pkg.source, &pkg.source.to_string()),
+        pkg.status.to_string().dimmed()
+    );
+    if !pkg.summary.trim().is_empty() {
+        println!("{}", sanitize(&pkg.summary));
     }
-    println!("  Source:   {}", pkg.source);
-    println!("  Status:   {}", pkg.status);
-    println!("  Category: {}", pkg.category);
-    println!("  Size:     {:.1} MB", pkg.size_mb);
+    println!();
+
+    let field = |label: &str, value: &str| {
+        if !value.trim().is_empty() {
+            println!("  {:<14}{}", label.dimmed(), sanitize(value));
+        }
+    };
+    field("Version", &pkg.version);
+    if let Some(installed) = &pkg.installed_version {
+        field("Installed", installed);
+    }
+    field("ID", &pkg.id);
+    field("Category", &pkg.category.to_string());
+    if pkg.size_mb > 0.0 {
+        field("Size", &format!("{:.1} MB", pkg.size_mb));
+    }
     if let Some(license) = &pkg.license {
-        println!("  License:  {}", sanitize(license));
+        field("License", license);
     }
     if let Some(homepage) = &pkg.homepage {
-        println!("  Homepage: {}", sanitize(homepage));
+        field("Homepage", homepage);
     }
-    if !pkg.summary.is_empty() {
-        println!("  Summary:  {}", sanitize(&pkg.summary));
+    if let Some(reference) = &pkg.flatpak_ref {
+        field("Flatpak ref", reference);
     }
-    if !pkg.description.is_empty() {
+    if let Some(remote) = &pkg.flatpak_remote {
+        field("Remote", remote);
+    }
+    if let (Some(owner), Some(project)) = (&pkg.copr_owner, &pkg.copr_project) {
+        field("COPR", &format!("{owner}/{project}"));
+    }
+    if pkg.downloads > 0 {
+        field("Downloads", &format!("{}/mo", pkg.downloads));
+    }
+    if !pkg.description.trim().is_empty() {
         println!();
         println!("{}", sanitize(pkg.description.trim()));
     }
@@ -542,6 +714,40 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_completions_subcommand() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["brim", "completions", "bash"]).unwrap();
+        let Commands::Completions { shell } = cli.command else {
+            panic!()
+        };
+        assert!(matches!(shell, ShellArg::Bash));
+        let cli = Cli::try_parse_from(["brim", "completions", "zsh"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Completions {
+                shell: ShellArg::Zsh
+            }
+        ));
+        assert!(Cli::try_parse_from(["brim", "completions", "fish"]).is_err());
+    }
+
+    #[test]
+    fn completions_generate_for_both_shells() {
+        use clap::CommandFactory;
+        for shell in [clap_complete::Shell::Bash, clap_complete::Shell::Zsh] {
+            let mut command = Cli::command();
+            let mut out = Vec::new();
+            clap_complete::generate(shell, &mut command, "brim", &mut out);
+            let script = String::from_utf8(out).unwrap();
+            assert!(
+                script.contains("search"),
+                "{shell} script lacks subcommands"
+            );
+            assert!(script.contains("completions"), "{shell} script is stale");
+        }
+    }
+
+    #[test]
     fn parse_bool_accepts_true_false_any_case() {
         assert_eq!(parse_bool("true"), Some(true));
         assert_eq!(parse_bool("True"), Some(true));
@@ -550,6 +756,48 @@ mod tests {
         assert_eq!(parse_bool("False"), Some(false));
         assert_eq!(parse_bool("yes"), None);
         assert_eq!(parse_bool("1"), None);
+    }
+
+    #[test]
+    fn result_number_only_matches_pure_digits() {
+        assert_eq!(result_number("1"), Some(1));
+        assert_eq!(result_number("42"), Some(42));
+        assert_eq!(result_number("7zip"), None);
+        assert_eq!(result_number("htop"), None);
+        assert_eq!(result_number(""), None);
+        assert_eq!(result_number("1.5"), None);
+        assert_eq!(result_number("+3"), None);
+        assert_eq!(result_number(" 3"), None);
+    }
+
+    #[test]
+    fn source_counts_breaks_down_by_source() {
+        let pkgs = vec![
+            Package::new("a", "a", SourceType::FedoraOfficial),
+            Package::new("b", "b", SourceType::FedoraOfficial),
+            Package::new("c", "c", SourceType::Flatpak),
+        ];
+        assert_eq!(source_counts(&pkgs), " (Fedora: 2, Flatpak: 1)");
+        assert_eq!(source_counts(&[]), "");
+    }
+
+    #[test]
+    fn fill_installed_versions_matches_by_id_without_overwriting() {
+        let mut updates = vec![
+            Package::new("htop.x86_64", "htop", SourceType::FedoraOfficial),
+            Package::new("org.app", "App", SourceType::Flatpak),
+            Package::new("gone.x86_64", "gone", SourceType::FedoraOfficial),
+        ];
+        updates[1].installed_version = Some("1.0".to_string());
+        let mut installed_htop = Package::new("htop.x86_64", "htop", SourceType::FedoraOfficial);
+        installed_htop.installed_version = Some("3.0".to_string());
+        let installed = vec![installed_htop];
+        fill_installed_versions(&mut updates, &installed);
+        assert_eq!(updates[0].installed_version.as_deref(), Some("3.0"));
+        // A version already set by the backend is never overwritten.
+        assert_eq!(updates[1].installed_version.as_deref(), Some("1.0"));
+        // Unknown ids stay empty (the table shows "—").
+        assert_eq!(updates[2].installed_version, None);
     }
 
     #[test]

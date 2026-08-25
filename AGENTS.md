@@ -2,21 +2,23 @@
 
 ## Project overview
 
-**Brim** is a pure-Rust package manager and app store for Fedora Linux. It
-unifies three package sources behind a single async engine and exposes them
-through three frontends in one `brim` binary:
+**Brim** is a pure-Rust package manager and app store for Fedora and Debian
+Linux. It unifies four package sources behind a single async engine and
+exposes them through three frontends in one `brim` binary:
 
-- **Backends**: DNF5 (official Fedora RPMs), COPR (community projects, via
-  the read-only COPR REST API for search/info and the `dnf copr` plugin for
+- **Backends**: DNF5 (official Fedora RPMs), APT (Debian/Ubuntu packages,
+  via `apt-get`/`apt-cache`/`dpkg-query`), COPR (community projects, via the
+  read-only COPR REST API for search/info and the `dnf copr` plugin for
   enable/disable), and Flatpak (Flathub).
 - **Frontends**: a terminal CLI (default), a native GTK4/Libadwaita desktop
   app (`brim gui`), and a web dashboard with a REST API (`brim web`).
 
 - Version `0.2.0`, Rust edition 2021, license **GPL-2.0-only**.
 - Repository: <https://github.com/b4lol/brim>
-- Target platform: Fedora Linux (developed on Fedora 44) with `dnf5`, `dnf`
-  (COPR plugin), and `flatpak` installed. Missing tools degrade gracefully —
-  unavailable backends are skipped rather than failing the whole operation.
+- Target platforms: Fedora Linux (developed on Fedora 44) with `dnf5`,
+  `dnf` (COPR plugin), and `flatpak`; Debian/Ubuntu with `apt` and
+  `flatpak`. Missing tools degrade gracefully — unavailable backends are
+  skipped rather than failing the whole operation.
 
 ## Technology stack
 
@@ -32,7 +34,8 @@ through three frontends in one `brim` binary:
   SPA compiled into the binary from `static/` via `include_str!`.
 - **GUI**: `gtk4` 0.11 (feature `v4_10`) and `libadwaita` 0.9 (feature
   `v1_5`) — requires system `gtk4-devel` and `libadwaita-devel` packages.
-- **CLI**: `clap` 4 (derive), `colored`, `indicatif`.
+- **CLI**: `clap` 4 (derive), `colored`, `indicatif`; `clap_complete`
+  generates the bash/zsh completion scripts (`brim completions <shell>`).
 - **Serialization**: `serde` / `serde_json` (config, sync export, REST API).
 - **Errors**: `thiserror` (`BrimError` in `src/core/error.rs`).
 
@@ -70,8 +73,10 @@ src/
 │   ├── backend.rs       Object-safe `Backend` trait (search/list/info/
 │   │                    install/remove/updates/upgrade/repo mgmt).
 │   ├── backends/
-│   │   ├── mod.rs       Shared helpers: probe, validate_arg, timeouts.
+│   │   ├── mod.rs       Shared helpers: probe, validate_arg, require_root,
+│   │   │                timeouts.
 │   │   ├── dnf5.rs      DNF5 backend (wraps the `dnf5` CLI).
+│   │   ├── apt.rs       APT backend (apt-get/apt-cache/dpkg-query).
 │   │   ├── copr.rs      COPR backend (REST API + `dnf copr` plugin).
 │   │   ├── flatpak.rs   Flatpak backend (wraps the `flatpak` CLI).
 │   │   └── cache.rs     Backend result caching.
@@ -85,7 +90,9 @@ src/
 │   ├── trending.rs      Flathub popular collection (24 h disk cache).
 │   └── fsutil.rs        Filesystem helpers.
 ├── cli/                 Terminal frontend (clap subcommands, tables,
-│                        prompts, output sanitizing, banner).
+│                        prompts, output sanitizing, banner, lastsearch —
+│                        the numbered-install cache behind
+│                        `brim install <#>`).
 ├── gui/                 GTK4/Libadwaita frontend: window, rows, css, icons,
 │                        worker (dedicated thread owning a tokio runtime;
 │                        GUI ⇄ worker over async-channel).
@@ -113,7 +120,8 @@ Key runtime architecture facts:
   timeout.
 - The GUI never blocks its main loop: all engine work runs on a worker
   thread with its own tokio runtime (`src/gui/worker.rs`).
-- Caches: `~/.cache/brim/trending.json` (24 h), `~/.cache/brim/icons/`.
+- Caches: `~/.cache/brim/trending.json` (24 h), `~/.cache/brim/icons/`,
+  `~/.cache/brim/last-search.json` (last search order for `install <#>`).
 - Config: `~/.config/brim/config.json`; unknown keys are preserved across
   load/save; sources disabled there are never constructed as backends.
   COPR defaults to **off** (community builds Fedora does not review); the
