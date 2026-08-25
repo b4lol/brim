@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/brim.svg" alt="Brim logo — a fedora's brim" width="128">
+
 # Brim
 
 **A modern, pure-Rust package manager and app store for Fedora Linux.**
@@ -42,9 +44,9 @@ glassmorphic web dashboard with a REST API.
 - **Trending page** — the desktop app opens on Flathub's popular collection,
   cached on disk for 24 hours (`~/.cache/brim/trending.json`) so repeat visits
   are instant and offline visits fall back to the stale cache.
-- **Material Design 3 UI** — the desktop app uses virtualized list rows
-  (only visible rows are rendered), an MD3 stylesheet, and a detail dialog
-  per package instead of a card grid.
+- **Native GNOME UI** — the desktop app follows the system light/dark style
+  (libadwaita), with virtualized list rows (only visible rows are rendered)
+  and a detail dialog per package instead of a card grid.
 - **Native HTTP** — all web access (COPR API, trending, icon downloads) goes
   through `reqwest` with rustls: pure-Rust TLS, connection reuse, no `curl`
   dependency at runtime.
@@ -60,11 +62,11 @@ glassmorphic web dashboard with a REST API.
 - **Real transactions** — install, remove, upgrade execute actual system
   changes via `dnf5` / `dnf copr` / `flatpak`; the CLI confirms first
   (`--yes` to skip).
-- **Repository management** — the desktop app's Repositories page lists,
-  adds and removes flatpak remotes (with `--user` retry and a
-  `--show-disabled` view) and lists/enables/disables COPR repos.
+- **Repository management** — the desktop app's Settings page lists, adds and
+  removes flatpak remotes (with `--user` retry and a `--show-disabled` view)
+  and lists/enables/disables COPR repos.
 - **Sync export/import** — back up the installed package set as a versioned
-  JSON file from the Installed page, and reinstall from it on a fresh
+  JSON file from the Settings page, and reinstall from it on a fresh
   system.
 - **Updates at a glance** — `dnf5 check-update` and
   `flatpak remote-ls --updates` merged into one pending-updates view, plus
@@ -143,19 +145,22 @@ handled properly).
 brim gui
 ```
 
-A native GNOME-style store with six pages — **Trending**, **Updates**,
-**Installed**, **COPR Spotlight**, **Repositories**, **Settings** — debounced
-live search, and toast notifications. The Trending page shows Flathub's
-popular collection
-(24 h disk cache). The Installed page has **Export**/**Import** buttons for
-backing up and restoring the installed set as JSON. Packages render as Material Design 3 list rows in a
+A native GNOME-style store with four pages — **Trending**, **Updates**,
+**Installed**, **Settings** — debounced live search, and toast notifications.
+The app follows the system light/dark style. The Trending page shows
+Flathub's popular collection
+(24 h disk cache). The Settings page holds the source switches, **Export**/
+**Import** of the installed set as JSON, and flatpak remote / COPR repo
+management. Packages render as list rows in a
 virtualized `ListView` (only the visible rows exist as widgets, so thousands
 of results scroll smoothly); clicking a row opens a detail dialog with the
 full description and actions. All package operations run on a background
 worker that executes requests concurrently, so searches stay responsive even
 during long transactions; icon downloads are batched and rate-limited so they
 never starve core events; destructive actions (Remove, Upgrade All) ask for
-confirmation first; closing the window shuts the worker down cleanly.
+confirmation first; closing the window shuts the worker down cleanly. The
+header bar's app menu opens an About dialog with version, license and
+project links.
 
 ## Web Dashboard
 

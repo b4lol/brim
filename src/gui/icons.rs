@@ -32,6 +32,38 @@ pub fn cache_dir() -> Option<PathBuf> {
     Some(base.join("brim").join("icons"))
 }
 
+/// Brim's own logo (a fedora's brim), bundled into the binary.
+const APP_ICON_SVG: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/brim.svg"));
+
+/// The themed icon name for Brim itself, when [`ensure_app_icon`] succeeded.
+pub const APP_ICON_NAME: &str = "brim";
+
+/// Install the bundled logo into the user's hicolor icon theme
+/// (`~/.local/share/icons`, idempotent) and make sure this session's icon
+/// theme searches that directory, so the About dialog and window decorations
+/// can show Brim's own logo. Returns `false` when the icon could not be
+/// installed — callers fall back to a symbolic system icon.
+pub fn ensure_app_icon() -> bool {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+    let Some(data_home) = data_home else {
+        return false;
+    };
+    let dir = data_home.join("icons/hicolor/scalable/apps");
+    let path = dir.join("brim.svg");
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    if current != APP_ICON_SVG
+        && (std::fs::create_dir_all(&dir).is_err() || std::fs::write(&path, APP_ICON_SVG).is_err())
+    {
+        return false;
+    }
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::IconTheme::for_display(&display).add_search_path(data_home.join("icons"));
+    }
+    true
+}
+
 /// Flatpak app ids are reverse-DNS (`org.example.App`): ASCII letters,
 /// digits, dots, underscores and dashes. The id comes from untrusted remote
 /// metadata, so anything else (notably `/` or `..`) must never reach a file

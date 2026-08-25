@@ -996,18 +996,22 @@ mod tests {
     fn from_config_omits_disabled_sources() {
         use crate::core::config::Config;
         let mut config = Config::default();
-        config.sources.copr = false;
+        config.sources.copr = true;
         let pm = PackageManager::from_config(&config);
         let sources: Vec<SourceType> = pm.backends.iter().map(|b| b.source()).collect();
         assert!(sources.contains(&SourceType::FedoraOfficial));
-        assert!(!sources.contains(&SourceType::Copr));
+        assert!(sources.contains(&SourceType::Copr));
         assert!(sources.contains(&SourceType::Flatpak));
-        let all = PackageManager::from_config(&Config::default());
-        assert_eq!(all.backends.len(), 3);
+        // COPR is off by default (opt-in): the default config builds two
+        // backends, Fedora and Flatpak.
+        let default = PackageManager::from_config(&Config::default());
+        let default_sources: Vec<SourceType> =
+            default.backends.iter().map(|b| b.source()).collect();
+        assert_eq!(default.backends.len(), 2);
+        assert!(!default_sources.contains(&SourceType::Copr));
         let none = PackageManager::from_config(&{
             let mut c = Config::default();
             c.sources.dnf5 = false;
-            c.sources.copr = false;
             c.sources.flatpak = false;
             c
         });

@@ -1,4 +1,4 @@
-//! MD3 package list rows and the virtualized list plumbing.
+//! Package list rows and the virtualized list plumbing.
 //!
 //! Every store page is a `gtk4::ListView` over a `gio::ListStore` of
 //! `BoxedAnyObject(Rc<Package>)`: only visible rows exist, so a 2000-hit
@@ -95,7 +95,6 @@ pub fn package_list(
     });
 
     let view = ListView::new(Some(selection), Some(factory));
-    view.add_css_class("md3-list");
     view.set_single_click_activate(true);
     view.connect_activate(move |view, position| {
         let Some(model) = view.model() else {
@@ -143,25 +142,27 @@ pub fn rebind_matching(store: &gio::ListStore, app_id: &str) {
     }
 }
 
-/// The empty MD3 row skeleton; widgets are filled on bind.
+/// The empty row skeleton; widgets are filled on bind.
 fn build_row(on_action: ActionFn) -> (Box, RowWidgets) {
     let root = Box::new(Orientation::Horizontal, 12);
-    root.add_css_class("md3-row");
+    root.add_css_class("package-row");
 
     let icon = Image::new();
     icon.set_pixel_size(40);
-    icon.add_css_class("md3-row-icon");
+    icon.set_margin_top(4);
+    icon.set_margin_bottom(4);
     root.append(&icon);
 
     let texts = Box::new(Orientation::Vertical, 2);
     texts.set_hexpand(true);
     texts.set_valign(Align::Center);
     let title = Label::new(None);
-    title.add_css_class("md3-title");
+    title.add_css_class("heading");
     title.set_xalign(0.0);
     title.set_ellipsize(EllipsizeMode::End);
     let subtitle = Label::new(None);
-    subtitle.add_css_class("md3-subtitle");
+    subtitle.add_css_class("dim-label");
+    subtitle.add_css_class("caption");
     subtitle.set_xalign(0.0);
     subtitle.set_ellipsize(EllipsizeMode::End);
     texts.append(&title);

@@ -93,6 +93,11 @@ src/
 │                        static_files.rs (embeds static/ into the binary).
 static/                  SPA assets (index.html, style.css, app.js) embedded
                          at compile time — edit them, not generated copies.
+assets/                  App artwork (brim.svg logo — a fedora's brim),
+                         bundled via include_str! and installed into the
+                         user's hicolor icon theme at GUI startup.
+examples/render_icon.rs  Dev helper: rasterizes assets/brim.svg for a
+                         visual check (not shipped).
 ```
 
 Key runtime architecture facts:
@@ -111,6 +116,8 @@ Key runtime architecture facts:
 - Caches: `~/.cache/brim/trending.json` (24 h), `~/.cache/brim/icons/`.
 - Config: `~/.config/brim/config.json`; unknown keys are preserved across
   load/save; sources disabled there are never constructed as backends.
+  COPR defaults to **off** (community builds Fedora does not review); the
+  GUI shows a risk-warning dialog before enabling it.
 
 ## Code style guidelines
 

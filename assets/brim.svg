@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="crown" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#63b3ee"/>
+      <stop offset="1" stop-color="#3f8fd2"/>
+    </linearGradient>
+    <linearGradient id="brim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4a97db"/>
+      <stop offset="1" stop-color="#2b66a8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- crown: rounded dome -->
+  <path d="M35 84 C35 56 40 39 48 31 C54 25 58 23 64 23 C70 23 74 25 80 31 C88 39 93 56 93 84 Z" fill="url(#crown)"/>
+  <!-- hat band -->
+  <path d="M35 84 C35 77 36 70 37 63 L91 63 C92 70 93 77 93 84 Z" fill="#1e4f88"/>
+  <!-- brim -->
+  <ellipse cx="64" cy="84" rx="58" ry="17" fill="url(#brim)"/>
+  <!-- brim top sheen -->
+  <ellipse cx="64" cy="81" rx="44" ry="10" fill="#5aa7e6" opacity="0.35"/>
+</svg>

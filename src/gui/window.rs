@@ -11,10 +11,10 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::Duration;
 
-use crate::core::{Package, PackageStatus, RepoInfo, SourceType};
+use crate::core::{Package, PackageStatus, RepoInfo};
 use adw::prelude::*;
 use adw::{
-    ApplicationWindow, Clamp, HeaderBar, Toast, ToastOverlay, ToolbarView, ViewStack, ViewSwitcher,
+    ApplicationWindow, HeaderBar, Toast, ToastOverlay, ToolbarView, ViewStack, ViewSwitcher,
 };
 use async_channel::Sender;
 use futures::FutureExt;
@@ -68,6 +68,15 @@ pub fn build(app: &adw::Application) {
     window.set_title(Some("Brim"));
     window.set_default_size(1100, 760);
 
+    // Brim's own logo for the window and About dialog; falls back to a
+    // symbolic system icon when it cannot be installed into the icon theme.
+    let app_icon: &'static str = if icons::ensure_app_icon() {
+        icons::APP_ICON_NAME
+    } else {
+        "system-software-install-symbolic"
+    };
+    window.set_icon_name(Some(app_icon));
+
     let header = HeaderBar::new();
     let stack = ViewStack::new();
 
@@ -80,6 +89,22 @@ pub fn build(app: &adw::Application) {
     search.set_placeholder_text(Some("Search packages…"));
     search.set_hexpand(false);
     header.pack_end(&search);
+
+    // App menu with the About dialog.
+    let menu = gio::Menu::new();
+    menu.append(Some("About Brim"), Some("app.about"));
+    let menu_button = gtk4::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .menu_model(&menu)
+        .tooltip_text("Main Menu")
+        .build();
+    header.pack_end(&menu_button);
+    let about = gio::SimpleAction::new("about", None);
+    {
+        let window = window.clone();
+        about.connect_activate(move |_, _| show_about(&window, app_icon));
+    }
+    app.add_action(&about);
 
     // Transaction pending state: buttons disabled while their transaction is
     // in flight, re-enabled on TransactionDone. Row buttons are tracked in
@@ -112,8 +137,8 @@ pub fn build(app: &adw::Application) {
         Rc::new(move |pkg| open_package_dialog(pkg, &window, on_action.clone()))
     };
 
-    // Pages: Trending, Updates, Installed, COPR Spotlight, Settings,
-    // Repositories.
+    // Pages: Trending, Updates, Installed, Settings (sources, sync and
+    // repository management live on the Settings page).
     let toast_overlay = ToastOverlay::new();
     toast_overlay.set_child(Some(&stack));
 
@@ -134,27 +159,16 @@ pub fn build(app: &adw::Application) {
         on_activate.clone(),
         pending_ids.clone(),
     );
-    let (installed_store, installed_page) = installed_page(
+    let (installed_store, installed_page) = flow_page(
         &stack,
-        &request_tx,
-        &window,
+        "installed",
+        "Installed",
+        "package-x-generic-symbolic",
         on_action.clone(),
         on_activate.clone(),
         pending_ids.clone(),
     );
-    let (spotlight_store, spotlight_page) = flow_page(
-        &stack,
-        "copr",
-        "COPR Spotlight",
-        "starred-symbolic",
-        on_action.clone(),
-        on_activate.clone(),
-        pending_ids.clone(),
-    );
-    settings_page(&stack, &request_tx, &shared_config);
-    // Repositories page: flatpak remotes and COPR repos as preferences
-    // groups with entry rows plus one boxed ListBox each for data rows.
-    let repos_groups = repos_page(&stack, &request_tx);
+    let repos_groups = settings_page(&stack, &request_tx, &shared_config, &window);
 
     let toolbar = ToolbarView::new();
     toolbar.add_top_bar(&header);
@@ -206,7 +220,7 @@ pub fn build(app: &adw::Application) {
                 Some("installed") => {
                     let _ = tx.try_send(CoreRequest::LoadInstalled);
                 }
-                Some("repos") => {
+                Some("settings") => {
                     let _ = tx.try_send(CoreRequest::LoadRepos);
                 }
                 _ => {}
@@ -262,28 +276,16 @@ pub fn build(app: &adw::Application) {
                             }
                         }
                         CoreEvent::SearchResults(query, packages) => {
-                            // Trending and COPR Spotlight are both fed from
-                            // the query currently shown, so they accept only
-                            // events tagged with that query. Anything else is
-                            // a stale result from a superseded search — drop
-                            // it instead of overwriting newer results.
+                            // The search page shows results for the query it
+                            // asked for, so it accepts only events tagged with
+                            // that query. Anything else is a stale result from
+                            // a superseded search — drop it instead of
+                            // overwriting newer results.
                             if accepts_results(&query, &last_query.borrow()) {
                                 populate(
                                     &trending_store,
                                     &trending_page,
                                     &packages,
-                                    &tx,
-                                    &shared_config,
-                                );
-                                let copr: Vec<Package> = packages
-                                    .iter()
-                                    .filter(|p| p.source == SourceType::Copr)
-                                    .cloned()
-                                    .collect();
-                                populate(
-                                    &spotlight_store,
-                                    &spotlight_page,
-                                    &copr,
                                     &tx,
                                     &shared_config,
                                 );
@@ -409,7 +411,6 @@ pub fn build(app: &adw::Application) {
                                     continue;
                                 }
                                 rows::rebind_matching(&trending_store, &app_id);
-                                rows::rebind_matching(&spotlight_store, &app_id);
                                 rows::rebind_matching(&installed_store, &app_id);
                                 rows::rebind_matching(&updates_store, &app_id);
                             }
@@ -436,6 +437,25 @@ pub fn build(app: &adw::Application) {
     window.present();
 }
 
+/// Present the About dialog with the app's identity and legal metadata.
+fn show_about(parent: &impl IsA<gtk4::Widget>, app_icon: &str) {
+    let about = adw::AboutDialog::builder()
+        .application_name("Brim")
+        .application_icon(app_icon)
+        .developer_name("b4lol")
+        .developers(["b4lol"])
+        .version(env!("CARGO_PKG_VERSION"))
+        .website("https://b4.lol")
+        .issue_url("https://github.com/b4lol/brim/issues")
+        .copyright("© 2026 b4lol")
+        .license_type(gtk4::License::Gpl20Only)
+        .comments(
+            "A package manager and app store for Fedora Linux:\nDNF5, COPR and Flatpak behind one interface.",
+        )
+        .build();
+    about.present(Some(parent));
+}
+
 /// Add a scrollable virtualized list page to the view stack; returns the
 /// store to fill and the stack toggling the empty state.
 fn flow_page(
@@ -452,14 +472,15 @@ fn flow_page(
         .child(&view)
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .build();
-    let empty = Label::new(Some("Nothing here yet"));
-    empty.add_css_class("dim-label");
+    let empty = adw::StatusPage::builder()
+        .icon_name(icon)
+        .title("Nothing here yet")
+        .build();
     let page = gtk4::Stack::new();
     page.add_named(&scroll, Some("list"));
     page.add_named(&empty, Some("empty"));
     page.set_visible_child_name("empty");
-    let clamp = Clamp::builder().child(&page).maximum_size(900).build();
-    stack.add_titled_with_icon(&clamp, Some(name), title, icon);
+    stack.add_titled_with_icon(&page, Some(name), title, icon);
     (store, page)
 }
 
@@ -528,18 +549,16 @@ fn updates_page(
         .hscrollbar_policy(gtk4::PolicyType::Never)
         .vexpand(true)
         .build();
-    let empty = Label::new(Some("Nothing here yet"));
-    empty.add_css_class("dim-label");
+    let empty = adw::StatusPage::builder()
+        .icon_name("software-update-available-symbolic")
+        .title("Everything is up to date")
+        .build();
     let page_stack = gtk4::Stack::new();
     page_stack.add_named(&scroll, Some("list"));
     page_stack.add_named(&empty, Some("empty"));
     page_stack.set_visible_child_name("empty");
     page_stack.set_vexpand(true);
-    let clamp = Clamp::builder()
-        .child(&page_stack)
-        .maximum_size(900)
-        .build();
-    page.append(&clamp);
+    page.append(&page_stack);
 
     stack.add_titled_with_icon(
         &page,
@@ -548,108 +567,6 @@ fn updates_page(
         "software-update-available-symbolic",
     );
     (store, page_stack, stats_label, upgrade_all)
-}
-
-/// The Installed page: an Export/Import sync bar above the list. Both flows
-/// only open file dialogs here (pure UI); all file I/O and brim-core calls
-/// run in the worker — export answers `SyncExported`, import answers
-/// `SyncParsed`, and the confirm dialog is presented from that event.
-fn installed_page(
-    stack: &ViewStack,
-    request_tx: &Sender<CoreRequest>,
-    window: &ApplicationWindow,
-    on_action: rows::ActionFn,
-    on_activate: rows::ActivateFn,
-    pending_ids: Rc<RefCell<HashSet<String>>>,
-) -> (gio::ListStore, gtk4::Stack) {
-    let page = Box::new(Orientation::Vertical, 0);
-
-    let bar = Box::new(Orientation::Horizontal, 12);
-    bar.set_margin_start(12);
-    bar.set_margin_end(12);
-    bar.set_margin_top(12);
-
-    let spacer = Label::new(None);
-    spacer.set_hexpand(true);
-    bar.append(&spacer);
-
-    let export_button = Button::with_label("Export");
-    {
-        let tx = request_tx.clone();
-        let window = window.clone();
-        export_button.connect_clicked(move |_| {
-            let tx = tx.clone();
-            let window = window.clone();
-            glib::spawn_future_local(async move {
-                let dialog = gtk4::FileDialog::new();
-                dialog.set_initial_name(Some("brim-sync.json"));
-                // Err means the user cancelled the dialog.
-                if let Ok(file) = dialog.save_future(Some(&window)).await {
-                    if let Some(path) = file.path() {
-                        if tx.try_send(CoreRequest::ExportSyncTo(path)).is_err() {
-                            eprintln!(
-                                "brim-gui: request channel full or closed; dropping sync export"
-                            );
-                        }
-                    }
-                }
-            });
-        });
-    }
-    bar.append(&export_button);
-
-    let import_button = Button::with_label("Import");
-    {
-        let tx = request_tx.clone();
-        let window = window.clone();
-        import_button.connect_clicked(move |_| {
-            let tx = tx.clone();
-            let window = window.clone();
-            glib::spawn_future_local(async move {
-                let dialog = gtk4::FileDialog::new();
-                let Ok(file) = dialog.open_future(Some(&window)).await else {
-                    return; // cancelled
-                };
-                let Some(path) = file.path() else {
-                    return;
-                };
-                // The worker reads and parses the file; the SyncParsed event
-                // continues the flow (toast or confirm dialog).
-                if tx.try_send(CoreRequest::ParseSyncFile(path)).is_err() {
-                    eprintln!("brim-gui: request channel full or closed; dropping sync import");
-                }
-            });
-        });
-    }
-    bar.append(&import_button);
-    page.append(&bar);
-
-    let (view, store) = rows::package_list(on_action, on_activate, pending_ids);
-    let scroll = ScrolledWindow::builder()
-        .child(&view)
-        .hscrollbar_policy(gtk4::PolicyType::Never)
-        .vexpand(true)
-        .build();
-    let empty = Label::new(Some("Nothing here yet"));
-    empty.add_css_class("dim-label");
-    let page_stack = gtk4::Stack::new();
-    page_stack.add_named(&scroll, Some("list"));
-    page_stack.add_named(&empty, Some("empty"));
-    page_stack.set_visible_child_name("empty");
-    page_stack.set_vexpand(true);
-    let clamp = Clamp::builder()
-        .child(&page_stack)
-        .maximum_size(900)
-        .build();
-    page.append(&clamp);
-
-    stack.add_titled_with_icon(
-        &page,
-        Some("installed"),
-        "Installed",
-        "package-x-generic-symbolic",
-    );
-    (store, page_stack)
 }
 
 /// Replace a page's contents with rows for `packages`. Missing icons are
@@ -740,7 +657,7 @@ fn handle_row_action(
     }
 }
 
-/// Open the MD3 detail dialog for a package.
+/// Open the detail dialog for a package.
 fn open_package_dialog(pkg: &Package, parent: &impl IsA<gtk4::Widget>, on_action: rows::ActionFn) {
     let dialog = adw::Dialog::new();
     dialog.set_title(&pkg.name);
@@ -751,7 +668,10 @@ fn open_package_dialog(pkg: &Package, parent: &impl IsA<gtk4::Widget>, on_action
     toolbar.add_top_bar(&HeaderBar::new());
 
     let content = Box::new(Orientation::Vertical, 12);
-    content.add_css_class("md3-dialog-content");
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+    content.set_margin_top(24);
+    content.set_margin_bottom(24);
 
     let icon = match icons::resolve_immediate(pkg) {
         IconChoice::File(path) => Image::from_file(&path),
@@ -761,11 +681,11 @@ fn open_package_dialog(pkg: &Package, parent: &impl IsA<gtk4::Widget>, on_action
     content.append(&icon);
 
     let name = Label::new(Some(&pkg.name));
-    name.add_css_class("md3-dialog-title");
+    name.add_css_class("title-2");
     content.append(&name);
 
     let meta = Label::new(Some(&dialog_meta(pkg)));
-    meta.add_css_class("md3-subtitle");
+    meta.add_css_class("dim-label");
     content.append(&meta);
 
     let description = Label::new(Some(if pkg.description.trim().is_empty() {
@@ -773,7 +693,6 @@ fn open_package_dialog(pkg: &Package, parent: &impl IsA<gtk4::Widget>, on_action
     } else {
         pkg.description.trim()
     }));
-    description.add_css_class("md3-body");
     description.set_wrap(true);
     description.set_xalign(0.0);
     content.append(&description);
@@ -833,12 +752,15 @@ fn format_count(count: u64) -> String {
     }
 }
 
-/// The Settings page: shared-config switches backed by preferences groups.
+/// The Settings page: source switches, interface options, sync export/import
+/// and repository management, all as preferences groups. Returns the repo
+/// group handles so the Repos event can rebuild their rows.
 fn settings_page(
     stack: &ViewStack,
     request_tx: &Sender<CoreRequest>,
     config: &Rc<RefCell<crate::core::Config>>,
-) {
+    window: &ApplicationWindow,
+) -> RepoGroups {
     let page = adw::PreferencesPage::new();
 
     let sources = adw::PreferencesGroup::builder()
@@ -855,7 +777,7 @@ fn settings_page(
             .subtitle(subtitle)
             .active(config.borrow().get(key).unwrap_or(true))
             .build();
-        connect_config_switch(&row, request_tx, config, key);
+        connect_config_switch(&row, request_tx, config, key, window);
         sources.add(&row);
     }
     page.add(&sources);
@@ -866,9 +788,79 @@ fn settings_page(
         .subtitle("Fetch missing Flathub icons from the CDN")
         .active(config.borrow().gui.icon_downloads)
         .build();
-    connect_config_switch(&icons, request_tx, config, "gui.icon_downloads");
+    connect_config_switch(&icons, request_tx, config, "gui.icon_downloads", window);
     interface.add(&icons);
     page.add(&interface);
+
+    // — Sync —
+    // Both rows only open file dialogs here (pure UI); all file I/O and
+    // brim-core calls run in the worker — export answers `SyncExported`,
+    // import answers `SyncParsed`, and the confirm dialog is presented from
+    // that event.
+    let sync = adw::PreferencesGroup::builder()
+        .title("Sync")
+        .description("Back up and restore the installed package set as JSON.")
+        .build();
+    let export_row = adw::ActionRow::builder()
+        .title("Export installed list")
+        .activatable(true)
+        .build();
+    export_row.add_suffix(&Image::from_icon_name("document-save-symbolic"));
+    {
+        let tx = request_tx.clone();
+        let window = window.clone();
+        export_row.connect_activated(move |_| {
+            let tx = tx.clone();
+            let window = window.clone();
+            glib::spawn_future_local(async move {
+                let dialog = gtk4::FileDialog::new();
+                dialog.set_initial_name(Some("brim-sync.json"));
+                // Err means the user cancelled the dialog.
+                if let Ok(file) = dialog.save_future(Some(&window)).await {
+                    if let Some(path) = file.path() {
+                        if tx.try_send(CoreRequest::ExportSyncTo(path)).is_err() {
+                            eprintln!(
+                                "brim-gui: request channel full or closed; dropping sync export"
+                            );
+                        }
+                    }
+                }
+            });
+        });
+    }
+    sync.add(&export_row);
+    let import_row = adw::ActionRow::builder()
+        .title("Import installed list")
+        .activatable(true)
+        .build();
+    import_row.add_suffix(&Image::from_icon_name("document-open-symbolic"));
+    {
+        let tx = request_tx.clone();
+        let window = window.clone();
+        import_row.connect_activated(move |_| {
+            let tx = tx.clone();
+            let window = window.clone();
+            glib::spawn_future_local(async move {
+                let dialog = gtk4::FileDialog::new();
+                let Ok(file) = dialog.open_future(Some(&window)).await else {
+                    return; // cancelled
+                };
+                let Some(path) = file.path() else {
+                    return;
+                };
+                // The worker reads and parses the file; the SyncParsed event
+                // continues the flow (toast or confirm dialog).
+                if tx.try_send(CoreRequest::ParseSyncFile(path)).is_err() {
+                    eprintln!("brim-gui: request channel full or closed; dropping sync import");
+                }
+            });
+        });
+    }
+    sync.add(&import_row);
+    page.add(&sync);
+
+    // — Repositories —
+    let repo_groups = add_repo_groups(&page, request_tx);
 
     stack.add_titled_with_icon(
         &page,
@@ -876,37 +868,84 @@ fn settings_page(
         "Settings",
         "emblem-system-symbolic",
     );
+    repo_groups
 }
 
 /// Wire a SwitchRow to a config key: on toggle, update the shared config,
-/// save it, and ask the worker to rebuild the manager.
+/// save it, and ask the worker to rebuild the manager. Enabling COPR asks
+/// for confirmation first: its packages are community builds that Fedora
+/// does not review.
 fn connect_config_switch(
     row: &adw::SwitchRow,
     request_tx: &Sender<CoreRequest>,
     config: &Rc<RefCell<crate::core::Config>>,
     key: &'static str,
+    window: &ApplicationWindow,
 ) {
     let tx = request_tx.clone();
     let config = config.clone();
+    let window = window.clone();
     row.connect_active_notify(move |row| {
-        {
-            let mut cfg = config.borrow_mut();
-            if !cfg.set(key, row.is_active()) {
-                return;
-            }
-            if let Err(error) = cfg.save() {
-                eprintln!("brim-gui: failed to save config: {error}");
-                return;
-            }
+        let active = row.is_active();
+        // No-op when the switch already matches the config — this is what
+        // makes the cancel-revert below silent (no save, reload or toast).
+        if config.borrow().get(key) == Some(active) {
+            return;
         }
-        if tx.try_send(CoreRequest::ReloadConfig).is_err() {
-            eprintln!("brim-gui: request channel full or closed; dropping config reload");
+        if key == "sources.copr" && active {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Enable COPR?")
+                .body(
+                    "COPR packages are built by the community and are not reviewed by Fedora. Only install projects you trust.",
+                )
+                .build();
+            dialog.add_responses(&[("cancel", "Cancel"), ("enable", "Enable Anyway")]);
+            dialog.set_response_appearance("enable", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let row = row.clone();
+            let tx = tx.clone();
+            let config = config.clone();
+            dialog.connect_response(None, move |_, response| {
+                if response == "enable" {
+                    apply_config_key(&config, &tx, key, true);
+                } else {
+                    // Reverts the switch; the re-entrant notify hits the
+                    // no-op guard above and stays silent.
+                    row.set_active(false);
+                }
+            });
+            dialog.present(Some(&window));
+            return;
         }
+        apply_config_key(&config, &tx, key, active);
     });
 }
 
-/// Handles for the Repositories page, so the Repos event can rebuild rows
-/// and re-enable the add buttons.
+/// Persist one config key and ask the worker to rebuild the manager.
+fn apply_config_key(
+    config: &Rc<RefCell<crate::core::Config>>,
+    tx: &Sender<CoreRequest>,
+    key: &str,
+    value: bool,
+) {
+    {
+        let mut cfg = config.borrow_mut();
+        if !cfg.set(key, value) {
+            return;
+        }
+        if let Err(error) = cfg.save() {
+            eprintln!("brim-gui: failed to save config: {error}");
+            return;
+        }
+    }
+    if tx.try_send(CoreRequest::ReloadConfig).is_err() {
+        eprintln!("brim-gui: request channel full or closed; dropping config reload");
+    }
+}
+
+/// Handles for the repository groups on the Settings page, so the Repos
+/// event can rebuild rows and re-enable the add buttons.
 #[derive(Clone)]
 struct RepoGroups {
     flatpak_list: gtk4::ListBox,
@@ -923,10 +962,9 @@ fn repo_list_box() -> gtk4::ListBox {
     list
 }
 
-/// The Repositories page (flatpak remotes + COPR repos).
-fn repos_page(stack: &ViewStack, request_tx: &Sender<CoreRequest>) -> RepoGroups {
-    let page = adw::PreferencesPage::new();
-
+/// Add the flatpak remote and COPR repo management groups to a preferences
+/// page; returns the handles the Repos event needs.
+fn add_repo_groups(page: &adw::PreferencesPage, request_tx: &Sender<CoreRequest>) -> RepoGroups {
     // — Flatpak remotes —
     let flatpak = adw::PreferencesGroup::builder()
         .title("Flatpak Remotes")
@@ -994,12 +1032,6 @@ fn repos_page(stack: &ViewStack, request_tx: &Sender<CoreRequest>) -> RepoGroups
     copr.add(&copr_list);
     page.add(&copr);
 
-    stack.add_titled_with_icon(
-        &page,
-        Some("repos"),
-        "Repositories",
-        "system-software-install-symbolic",
-    );
     RepoGroups {
         flatpak_list,
         copr_list,
@@ -1118,6 +1150,7 @@ fn confirm_simple(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::SourceType;
 
     #[test]
     fn dispatch_latest_nonempty_query() {

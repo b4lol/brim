@@ -59,7 +59,7 @@ pub enum CoreRequest {
     LoadStats,
     LoadTrending,
     /// Configured repositories (flatpak remotes + COPR repos) for the
-    /// Repositories page.
+    /// repository groups on the Settings page.
     LoadRepos,
     /// Add a flatpak remote (name, .flatpakrepo URL).
     AddFlatpakRemote(String, String),
@@ -94,7 +94,7 @@ pub enum CoreEvent {
     Stats(SystemStats),
     /// Flathub's most popular apps for the Trending page.
     Trending(Vec<Package>),
-    /// Configured repositories for the Repositories page.
+    /// Configured repositories for the Settings page's repository groups.
     Repos(Vec<crate::core::RepoInfo>),
     TransactionDone(TransactionResult),
     /// Sync export finished: Ok(path written) or Err(message).

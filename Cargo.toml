@@ -3,6 +3,9 @@ name = "brim"
 version = "0.2.0"
 edition = "2021"
 license = "GPL-2.0-only"
+authors = ["b4lol"]
+description = "A package manager and app store for Fedora Linux: DNF5, COPR and Flatpak behind one interface."
+homepage = "https://b4.lol"
 repository = "https://github.com/b4lol/brim"
 
 [[bin]]

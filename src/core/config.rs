@@ -37,7 +37,9 @@ impl Default for SourceConfig {
     fn default() -> Self {
         Self {
             dnf5: true,
-            copr: true,
+            // COPR ships community builds that Fedora does not review, so it
+            // is opt-in: the GUI asks with a risk warning before enabling it.
+            copr: false,
             flatpak: true,
         }
     }
@@ -262,7 +264,7 @@ mod tests {
         let config = Config::load_from(&path);
         assert!(!config.sources.flatpak);
         assert!(config.sources.dnf5);
-        assert!(config.sources.copr);
+        assert!(!config.sources.copr);
         assert!(config.gui.icon_downloads);
         let _ = std::fs::remove_file(&path);
     }

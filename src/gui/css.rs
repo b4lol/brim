@@ -1,98 +1,48 @@
-//! Application-wide styling: Material Design 3 baseline (dark).
+//! Application-wide styling: native libadwaita look. The app follows the
+//! system light/dark style; only row layout and source badges need custom
+//! rules, and those use libadwaita palette variables so they adapt to both.
 
 use gtk4::gdk::Display;
 use gtk4::{CssProvider, STYLE_PROVIDER_PRIORITY_APPLICATION};
 
 const CSS: &str = r#"
-/* Material Design 3 baseline (dark) for Brim. */
-
-window {
-    background-color: #131314;
-    color: #e3e3e3;
-}
-
 /* — List rows — */
 
-.md3-list row,
-.md3-list {
-    background-color: transparent;
-}
-
-.md3-row {
+.package-row {
     min-height: 56px;
     padding: 8px 16px;
-    border-bottom: 1px solid #444746; /* outline-variant */
+    border-bottom: 1px solid alpha(currentColor, 0.1);
 }
 
-.md3-row:hover {
-    background-color: alpha(#e3e3e3, 0.08);
+.package-row:hover {
+    background-color: alpha(currentColor, 0.06);
 }
 
-.md3-row-icon {
-    margin: 4px 0;
-}
-
-.md3-title {
-    font-weight: 500;
-    font-size: 1rem; /* title-medium */
-    color: #e3e3e3; /* on-surface */
-}
-
-.md3-subtitle {
-    font-size: 0.875rem; /* body-medium */
-    color: #c4c7c7; /* on-surface-variant */
-}
-
-.md3-body {
-    font-size: 0.875rem;
-    color: #e3e3e3;
-}
-
-/* — Source badges — */
+/* — Source badges (palette tints adapt to light and dark) — */
 
 .badge-fedora,
 .badge-copr,
 .badge-flatpak {
     border-radius: 8px;
-    padding: 4px 10px;
+    padding: 2px 8px;
     font-size: 0.75rem;
     font-weight: 500;
 }
 
 .badge-fedora {
-    background-color: #a8c7fa; /* primary-80 */
-    color: #0b305f;
+    background-color: alpha(@blue_2, 0.35);
 }
 
 .badge-copr {
-    background-color: #efb8c8; /* tertiary-80 */
-    color: #492532;
+    background-color: alpha(@purple_2, 0.35);
 }
 
 .badge-flatpak {
-    background-color: #8dd5c0; /* secondary-80 */
-    color: #00382d;
-}
-
-/* — Dialog — */
-
-.md3-dialog-content {
-    padding: 24px;
-}
-
-.md3-dialog-title {
-    font-size: 1.375rem; /* headline-small */
-    font-weight: 500;
-}
-
-/* — Misc — */
-
-.dim-label {
-    color: #c4c7c7;
+    background-color: alpha(@green_2, 0.35);
 }
 "#;
 
-/// Load the Brim Material Design 3 stylesheet onto the default display.
+/// Load the Brim stylesheet onto the default display.
 pub fn load_css() {
     let provider = CssProvider::new();
     provider.load_from_data(CSS);
