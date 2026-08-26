@@ -99,22 +99,28 @@ Fedora that is DNF5 + Flatpak (+ COPR), on Debian/Ubuntu APT + Flatpak.
 ```bash
 git clone https://github.com/b4lol/brim
 cd brim
-cargo install --path . --locked
+just install
 ```
 
-This installs a single `brim` binary: the terminal CLI by default, the
-desktop app via `brim gui`, and the web server via `brim web`. (Without
-installing, `cargo build --release` puts the same binary in
-`target/release/brim`.)
+`just install` (requires [just](https://github.com/casey/just)) installs a
+single `brim` binary twice: into `~/.cargo/bin` for your user and into
+`/usr/local/bin` system-wide. The system-wide copy matters because
+system-package transactions run with `sudo`, and root's `secure_path` does
+not cover `~/.cargo/bin` — without it `sudo brim ...` fails with "command
+not found". Re-run `just install` after every upgrade so the root copy
+never goes stale.
 
-System-package transactions run with `sudo`, and root's `secure_path` does
-not cover `~/.cargo/bin` — so also install system-wide:
+Without `just`, the two manual steps are equivalent:
 
 ```bash
+cargo install --path . --locked
 sudo install -m 0755 ~/.cargo/bin/brim /usr/local/bin/brim
 ```
 
-Re-run that after every upgrade so the root copy never goes stale.
+The binary serves all three frontends: the terminal CLI by default, the
+desktop app via `brim gui`, and the web server via `brim web`. Other `just`
+recipes: `just check` (full CI suite), `just completions` (bash/zsh),
+`just uninstall`. Run `just` to list them all.
 
 ## CLI Usage
 

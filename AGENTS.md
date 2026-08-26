@@ -41,7 +41,8 @@ exposes them through three frontends in one `brim` binary:
 
 ## Build and test commands
 
-The full verification suite (identical to CI, all four must pass):
+The full verification suite (identical to CI, all four must pass) is
+`just check`, or run the steps directly:
 
 ```bash
 cargo fmt --all -- --check
@@ -53,8 +54,12 @@ cargo build --release
 Install the binary locally:
 
 ```bash
-cargo install --path . --locked
+just install   # or: cargo install --path . --locked
 ```
+
+`just install` also copies the binary to `/usr/local/bin` so that
+`sudo brim ...` works (root's `secure_path` excludes `~/.cargo/bin`).
+See `justfile` for all recipes (`just` lists them).
 
 GUI build prerequisites (Fedora): `sudo dnf5 install gtk4-devel libadwaita-devel`.
 
