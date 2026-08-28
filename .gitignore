@@ -5,15 +5,8 @@
 *.pdb
 
 # ── Internal documentation (not published to the public repo) ─────────
-/PROJECT.md
 /PHASES.md
-/ROADMAP.md
-/ARCHITECTURE.md
-/TODO.md
-/DECISIONS.md
 /LESSONS.md
-/CHANGELOG.md
-/CODE_REVIEW.md
 /docs
 
 # ── Workflow / agent scratch ──────────────────────────────────────────
